@@ -8,3 +8,4 @@ openpyxl
 openai
 python-multipart
 email-validator
+google-genai
