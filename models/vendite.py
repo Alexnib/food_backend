@@ -23,3 +23,6 @@ class VenditaBulkItem(BaseModel):
 
 class VenditaBulkPayload(BaseModel):
     items: List[VenditaBulkItem]
+
+class VenditaBulkDelete(BaseModel):
+    ids: List[int]

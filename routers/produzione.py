@@ -76,7 +76,7 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
 @router.get("/ricette")
 async def get_ricette(auth_data = Depends(get_user_sede)):
     # Restituiamo le ricette e includiamo in automatico i loro ingredienti nidificati e categorie!
-    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, anagrafica_materia_prima(articolo, unita_misura))").eq("id_sede", auth_data["id_sede"]).execute()
+    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, anagrafica_materia_prima(articolo, unita_misura, costo_netto))").eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
 @router.put("/ricette/{id}")
