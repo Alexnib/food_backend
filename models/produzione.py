@@ -13,4 +13,6 @@ class RicettaCreate(BaseModel):
     descrizione_ricetta: Optional[str] = None
     id_categoria_prodotto: Optional[int] = None
     ingredienti: List[IngredienteRicettaItem] # Riceviamo la lista in un colpo solo!
+    prezzo_vendita_lordo: float = 0.0
     prezzo_vendita_netto: float = 0.0
+    id_iva_vendita: int

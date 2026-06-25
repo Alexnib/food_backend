@@ -145,7 +145,7 @@ async def export_vendite(
     try:
         # Recupera le vendite nel range temporale unendo i nomi dei prodotti e i prezzi
         res = supabase.table("vendite").select(
-            "data_vendita, quantita, ricette(nome_ricetta, prezzo_vendita_netto), anagrafica_rivendita(nome_articolo, prezzo_vendita)"
+            "data_vendita, quantita, ricette(nome_ricetta, prezzo_vendita_netto), anagrafica_rivendita(nome_articolo, prezzo_vendita_netto)"
         ).eq("id_sede", auth_data["id_sede"])\
          .gte("data_vendita", start_date)\
          .lte("data_vendita", end_date)\
@@ -168,7 +168,7 @@ async def export_vendite(
             # Gestione prodotto commerciale (Rivendita)
             elif item.get("anagrafica_rivendita") and item["anagrafica_rivendita"]:
                 nome_prodotto = item["anagrafica_rivendita"].get("nome_articolo", "N/D")
-                prezzo_unitario = item["anagrafica_rivendita"].get("prezzo_vendita", 0.0)
+                prezzo_unitario = item["anagrafica_rivendita"].get("prezzo_vendita_netto", 0.0)
 
             quantita = item["quantita"]
             flat_data.append({

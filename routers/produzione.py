@@ -17,7 +17,9 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
             "id_categoria_prodotto": data.id_categoria_prodotto,
             "id_sede": auth_data["id_sede"],
             "costo_ricetta_reale": 0.0,
-            "prezzo_vendita_netto": data.prezzo_vendita_netto
+            "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
+            "prezzo_vendita_netto": data.prezzo_vendita_netto,
+            "id_iva_vendita": data.id_iva_vendita
         }
         res_ricetta = supabase.table("ricette").insert(ricetta_insert).execute()
         id_ricetta_creata = res_ricetta.data[0]["id"]
@@ -29,12 +31,12 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
         if data.ingredienti:
             for ing in data.ingredienti:
                 # Peschiamo il costo unitario della materia prima dal DB
-                mp_res = supabase.table("anagrafica_materia_prima").select("costo_netto").eq("id", ing.id_materia_prima).execute()
+                mp_res = supabase.table("anagrafica_materia_prima").select("prezzo_acquisto_netto").eq("id", ing.id_materia_prima).execute()
                 
                 if not mp_res.data:
                     continue # Se non trova la materia prima, la salta
                 
-                costo_unitario = mp_res.data[0]["costo_netto"]
+                costo_unitario = mp_res.data[0]["prezzo_acquisto_netto"]
                 
                 # LA MATEMATICA DELLO SCARTO (Es. 20% scarto -> Resa 80% -> 0.8)
                 resa = 1 - (ing.perc_scarto / 100)
@@ -61,7 +63,9 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
 
         supabase.table("ricette").update({
             "costo_ricetta_reale": costo_finale,
-            "prezzo_vendita_netto": data.prezzo_vendita_netto
+            "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
+            "prezzo_vendita_netto": data.prezzo_vendita_netto,
+            "id_iva_vendita": data.id_iva_vendita
         }).eq("id", id_ricetta_creata).execute()
 
         return {
@@ -76,7 +80,7 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
 @router.get("/ricette")
 async def get_ricette(auth_data = Depends(get_user_sede)):
     # Restituiamo le ricette e includiamo in automatico i loro ingredienti nidificati e categorie!
-    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, anagrafica_materia_prima(articolo, unita_misura, costo_netto))").eq("id_sede", auth_data["id_sede"]).execute()
+    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, anagrafica_materia_prima(articolo, unita_misura, prezzo_acquisto_netto))").eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
 @router.put("/ricette/{id}")
@@ -91,9 +95,9 @@ async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_u
 
         if data.ingredienti:
             for ing in data.ingredienti:
-                mp_res = supabase.table("anagrafica_materia_prima").select("costo_netto").eq("id", ing.id_materia_prima).execute()
+                mp_res = supabase.table("anagrafica_materia_prima").select("prezzo_acquisto_netto").eq("id", ing.id_materia_prima).execute()
                 if not mp_res.data: continue
-                costo_unitario = mp_res.data[0]["costo_netto"]
+                costo_unitario = mp_res.data[0]["prezzo_acquisto_netto"]
                 
                 resa = 1 - (ing.perc_scarto / 100)
                 quantita_effettiva = (ing.quantita_per_kg / resa) if resa > 0 else ing.quantita_per_kg
@@ -118,7 +122,9 @@ async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_u
             "descrizione_ricetta": data.descrizione_ricetta,
             "id_categoria_prodotto": data.id_categoria_prodotto,
             "costo_ricetta_reale": costo_finale,
-            "prezzo_vendita_netto": data.prezzo_vendita_netto
+            "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
+            "prezzo_vendita_netto": data.prezzo_vendita_netto,
+            "id_iva_vendita": data.id_iva_vendita
         }
         res = supabase.table("ricette").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
         

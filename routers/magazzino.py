@@ -17,6 +17,14 @@ async def get_provenienza():
     res = supabase.table("provenienza_prodotto").select("*").execute()
     return res.data
 
+@router.get("/iva")
+async def get_iva():
+    import os
+    from supabase import create_client
+    local_supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    res = local_supabase.table("iva").select("*").execute()
+    return res.data
+
 @router.post("/categorie", status_code=status.HTTP_201_CREATED)
 async def create_categoria(data: CategoriaProdottoCreate, auth_data = Depends(get_user_sede)):
     insert_data = data.model_dump(mode="json")
@@ -88,8 +96,8 @@ async def create_rivendita(data: ProdottoRivenditaCreate, auth_data = Depends(ge
     insert_data = data.model_dump(mode="json")
     insert_data["id_sede"] = auth_data["id_sede"]
     
-    # Calcolo automatico dei margini
-    margine, margine_perc = calcola_margini(insert_data["prezzo_vendita"], insert_data["food_cost"])
+    # Calcolo automatico dei margini usando i prezzi netti
+    margine, margine_perc = calcola_margini(insert_data["prezzo_vendita_netto"], insert_data["prezzo_acquisto_netto"])
     insert_data["margine"] = margine
     insert_data["margine_perc"] = margine_perc
 
@@ -98,7 +106,6 @@ async def create_rivendita(data: ProdottoRivenditaCreate, auth_data = Depends(ge
 
 @router.get("/rivendita")
 async def get_rivendita(auth_data = Depends(get_user_sede)):
-    # Join con categoria_prodotti per avere il nome della categoria
     res = supabase.table("anagrafica_rivendita").select("*, categoria_prodotti(nome_categoria)").eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
@@ -106,22 +113,16 @@ async def get_rivendita(auth_data = Depends(get_user_sede)):
 async def update_rivendita(id: str, data: ProdottoRivenditaUpdate, auth_data = Depends(get_user_sede)):
     update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
     
-    if not update_data:
-        return {"message": "Nessun dato da aggiornare."}
-
-    # Se viene aggiornato il costo o il prezzo, dobbiamo ricalcolare il margine
-    if "prezzo_vendita" in update_data or "food_cost" in update_data:
-        # Recuperiamo il record attuale per avere i valori mancanti
-        current = supabase.table("anagrafica_rivendita").select("prezzo_vendita, food_cost").eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
-        if not current.data:
-            raise HTTPException(status_code=404, detail="Prodotto non trovato")
-        
-        prezzo_attuale = update_data.get("prezzo_vendita", current.data[0]["prezzo_vendita"])
-        costo_attuale = update_data.get("food_cost", current.data[0]["food_cost"])
-        
-        margine, margine_perc = calcola_margini(prezzo_attuale, costo_attuale)
-        update_data["margine"] = margine
-        update_data["margine_perc"] = margine_perc
+    # Ricalcola i margini se uno dei due prezzi netti viene modificato
+    if "prezzo_vendita_netto" in update_data or "prezzo_acquisto_netto" in update_data:
+        # Recupera il prodotto attuale per i valori non modificati
+        old_data = supabase.table("anagrafica_rivendita").select("prezzo_vendita_netto, prezzo_acquisto_netto").eq("id", id).execute()
+        if old_data.data:
+            pv = update_data.get("prezzo_vendita_netto", old_data.data[0]["prezzo_vendita_netto"])
+            fc = update_data.get("prezzo_acquisto_netto", old_data.data[0]["prezzo_acquisto_netto"])
+            margine, margine_perc = calcola_margini(pv, fc)
+            update_data["margine"] = margine
+            update_data["margine_perc"] = margine_perc
 
     res = supabase.table("anagrafica_rivendita").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
     return res.data[0] if res.data else None
