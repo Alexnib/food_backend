@@ -37,8 +37,7 @@ async def save_imported_products(request: SaveImportRequest, auth_data = Depends
     iva_res = supabase.table("iva").select("*").execute()
     iva_list = iva_res.data or []
     
-    materie_prime_to_insert = []
-    rivendita_to_insert = []
+    articoli_to_insert = []
     costi_to_insert = []
     
     mesi_ita = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
@@ -51,35 +50,34 @@ async def save_imported_products(request: SaveImportRequest, auth_data = Depends
         id_iva = next((i["id"] for i in iva_list if i["iva"] == item.iva_perc), iva_list[0]["id"] if iva_list else None)
         
         if item.tipo == "Materia Prima":
-            materie_prime_to_insert.append({
-                "id_sede": id_sede,
-                "articolo": item.nome_prodotto,
-                "unita_misura": item.unita_misura,
-                "prezzo_acquisto_netto": item.costo_netto,
-                "prezzo_acquisto_lordo": item.costo_lordo,
-                "id_iva_acquisto": id_iva,
-                "fornitore": "Sconosciuto",
-                "anno": anno_corrente
-            })
-        elif item.tipo == "Rivendita":
-            pv_netto = 0.0
-            pv_lordo = 0.0
-            margine = 0.0
-            margine_perc = 0.0
-            
-            rivendita_to_insert.append({
+            articoli_to_insert.append({
                 "id_sede": id_sede,
                 "nome_articolo": item.nome_prodotto,
                 "unita_misura": item.unita_misura,
                 "prezzo_acquisto_netto": item.costo_netto,
                 "prezzo_acquisto_lordo": item.costo_lordo,
-                "prezzo_vendita_netto": pv_netto,
-                "prezzo_vendita_lordo": pv_lordo,
-                "margine": margine,
-                "margine_perc": margine_perc,
+                "id_iva_acquisto": id_iva,
+                "fornitore": "Sconosciuto",
+                "anno": anno_corrente,
+                "is_materia_prima": True,
+                "is_rivendita": False
+            })
+        elif item.tipo == "Rivendita":
+            articoli_to_insert.append({
+                "id_sede": id_sede,
+                "nome_articolo": item.nome_prodotto,
+                "unita_misura": item.unita_misura,
+                "prezzo_acquisto_netto": item.costo_netto,
+                "prezzo_acquisto_lordo": item.costo_lordo,
+                "prezzo_vendita_netto": 0.0,
+                "prezzo_vendita_lordo": 0.0,
+                "margine": 0.0,
+                "margine_perc": 0.0,
                 "id_iva_acquisto": id_iva,
                 "id_iva_rivendita": id_iva,
-                "id_categoria_prodotto": item.id_categoria
+                "id_categoria_prodotto": item.id_categoria,
+                "is_materia_prima": False,
+                "is_rivendita": True
             })
         elif item.tipo == "Costo":
             costi_to_insert.append({
@@ -93,13 +91,11 @@ async def save_imported_products(request: SaveImportRequest, auth_data = Depends
             })
             
     try:
-        if materie_prime_to_insert:
-            supabase.table("anagrafica_materia_prima").insert(materie_prime_to_insert).execute()
-        if rivendita_to_insert:
-            supabase.table("anagrafica_rivendita").insert(rivendita_to_insert).execute()
+        if articoli_to_insert:
+            supabase.table("articoli").insert(articoli_to_insert).execute()
         if costi_to_insert:
             supabase.table("costi_anno_mese").insert(costi_to_insert).execute()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Errore nel salvataggio: {str(e)}")
         
-    return {"message": "Importazione completata con successo", "inseriti_materie": len(materie_prime_to_insert), "inseriti_rivendita": len(rivendita_to_insert), "inseriti_costi": len(costi_to_insert)}
+    return {"message": "Importazione completata con successo", "inseriti_articoli": len(articoli_to_insert), "inseriti_costi": len(costi_to_insert)}

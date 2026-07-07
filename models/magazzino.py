@@ -9,48 +9,39 @@ class CategoriaProdottoUpdate(BaseModel):
     nome_categoria: Optional[str] = None
     id_macro_categoria: Optional[int] = None
 
-class MateriaPrimaCreate(BaseModel):
-    articolo: str
-    unita_misura: str
-    prezzo_acquisto_lordo: float
-    prezzo_acquisto_netto: float
-    id_iva_acquisto: int
-    fornitore: Optional[str] = None
-    partita_iva: Optional[str] = None
-    anno: Optional[int] = None
-
-class MateriaPrimaUpdate(BaseModel):
-    articolo: Optional[str] = None
-    unita_misura: Optional[str] = None
-    prezzo_acquisto_lordo: Optional[float] = None
-    prezzo_acquisto_netto: Optional[float] = None
-    id_iva_acquisto: Optional[int] = None
-    fornitore: Optional[str] = None
-    partita_iva: Optional[str] = None
-    anno: Optional[int] = None
-
-class ProdottoRivenditaCreate(BaseModel):
+class ArticoloCreate(BaseModel):
     nome_articolo: str
     unita_misura: str
     prezzo_acquisto_lordo: float
     prezzo_acquisto_netto: float
-    id_iva_acquisto: int
-    prezzo_vendita_lordo: float
-    prezzo_vendita_netto: float
-    id_iva_rivendita: int
-    id_categoria_prodotto: int
+    id_iva_acquisto: Optional[int] = None
+    fornitore: Optional[str] = None
+    partita_iva: Optional[str] = None
+    anno: Optional[int] = None
+    is_materia_prima: bool = False
+    is_rivendita: bool = False
+    prezzo_vendita_lordo: float = 0.0
+    prezzo_vendita_netto: float = 0.0
+    id_iva_rivendita: Optional[int] = None
+    id_categoria_prodotto: Optional[int] = None
+    stock: Optional[int] = None
 
-class ProdottoRivenditaUpdate(BaseModel):
+class ArticoloUpdate(BaseModel):
     nome_articolo: Optional[str] = None
     unita_misura: Optional[str] = None
     prezzo_acquisto_lordo: Optional[float] = None
     prezzo_acquisto_netto: Optional[float] = None
     id_iva_acquisto: Optional[int] = None
+    fornitore: Optional[str] = None
+    partita_iva: Optional[str] = None
+    anno: Optional[int] = None
+    is_materia_prima: Optional[bool] = None
+    is_rivendita: Optional[bool] = None
     prezzo_vendita_lordo: Optional[float] = None
     prezzo_vendita_netto: Optional[float] = None
     id_iva_rivendita: Optional[int] = None
-    stock: Optional[int] = None
     id_categoria_prodotto: Optional[int] = None
+    stock: Optional[int] = None
 
 class ImportedProduct(BaseModel):
     nome_prodotto: str = Field(description="Il nome del prodotto pulito")

@@ -31,7 +31,7 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
         if data.ingredienti:
             for ing in data.ingredienti:
                 # Peschiamo il costo unitario della materia prima dal DB
-                mp_res = supabase.table("anagrafica_materia_prima").select("prezzo_acquisto_netto").eq("id", ing.id_materia_prima).execute()
+                mp_res = supabase.table("articoli").select("prezzo_acquisto_netto").eq("id", ing.id_articolo).execute()
                 
                 if not mp_res.data:
                     continue # Se non trova la materia prima, la salta
@@ -49,7 +49,7 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
                 # Prepariamo la riga per il database
                 ingredienti_da_inserire.append({
                     "id_ricetta": id_ricetta_creata,
-                    "id_materia_prima": ing.id_materia_prima,
+                    "id_articolo": ing.id_articolo,
                     "quantita_per_kg": ing.quantita_per_kg,
                     "perc_scarto": ing.perc_scarto
                 })
@@ -80,7 +80,7 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
 @router.get("/ricette")
 async def get_ricette(auth_data = Depends(get_user_sede)):
     # Restituiamo le ricette e includiamo in automatico i loro ingredienti nidificati e categorie!
-    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, anagrafica_materia_prima(articolo, unita_misura, prezzo_acquisto_netto))").eq("id_sede", auth_data["id_sede"]).execute()
+    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, articoli(nome_articolo, unita_misura, prezzo_acquisto_netto))").eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
 @router.put("/ricette/{id}")
@@ -95,7 +95,7 @@ async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_u
 
         if data.ingredienti:
             for ing in data.ingredienti:
-                mp_res = supabase.table("anagrafica_materia_prima").select("prezzo_acquisto_netto").eq("id", ing.id_materia_prima).execute()
+                mp_res = supabase.table("articoli").select("prezzo_acquisto_netto").eq("id", ing.id_articolo).execute()
                 if not mp_res.data: continue
                 costo_unitario = mp_res.data[0]["prezzo_acquisto_netto"]
                 
@@ -106,7 +106,7 @@ async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_u
 
                 ingredienti_da_inserire.append({
                     "id_ricetta": id,
-                    "id_materia_prima": ing.id_materia_prima,
+                    "id_articolo": ing.id_articolo,
                     "quantita_per_kg": ing.quantita_per_kg,
                     "perc_scarto": ing.perc_scarto
                 })

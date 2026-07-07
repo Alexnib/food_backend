@@ -44,7 +44,7 @@ async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_
             if id_ricetta:
                 query = query.eq("id_ricetta", id_ricetta)
             elif id_commerciale:
-                query = query.eq("id_prodotto_commerciale", id_commerciale)
+                query = query.eq("id_articolo", id_commerciale)
                 
             existing = query.execute()
             
@@ -61,7 +61,7 @@ async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_
                     "quantita": item.quantita,
                     "id_sede": auth_data["id_sede"],
                     "id_ricetta": id_ricetta,
-                    "id_prodotto_commerciale": id_commerciale,
+                    "id_articolo": id_commerciale,
                 }
                 res = supabase.table("vendite").insert(record).execute()
                 results.append(res.data[0])
@@ -74,7 +74,7 @@ async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_
 async def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
     try:
         # Validazione base: deve esserci almeno uno dei due prodotti
-        if not data.id_ricetta and not data.id_prodotto_commerciale:
+        if not data.id_ricetta and not data.id_articolo:
             raise HTTPException(status_code=400, detail="Devi specificare quale prodotto è stato venduto.")
 
         # Controlla se esiste già una vendita per questo prodotto in questa data per questa sede
@@ -82,7 +82,7 @@ async def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sed
         if data.id_ricetta:
             query = query.eq("id_ricetta", data.id_ricetta)
         else:
-            query = query.eq("id_prodotto_commerciale", data.id_prodotto_commerciale)
+            query = query.eq("id_articolo", data.id_articolo)
             
         existing = query.execute()
         
@@ -120,7 +120,7 @@ async def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get
 async def get_vendite(auth_data = Depends(get_user_sede)):
     # Recupera le vendite unendo i nomi delle ricette e dei prodotti commerciali per comodità visiva
     res = supabase.table("vendite").select(
-        "*, ricette(nome_ricetta), anagrafica_rivendita(nome_articolo)"
+        "*, ricette(nome_ricetta), articoli(nome_articolo)"
     ).eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
@@ -145,7 +145,7 @@ async def export_vendite(
     try:
         # Recupera le vendite nel range temporale unendo i nomi dei prodotti e i prezzi
         res = supabase.table("vendite").select(
-            "data_vendita, quantita, ricette(nome_ricetta, prezzo_vendita_netto), anagrafica_rivendita(nome_articolo, prezzo_vendita_netto)"
+            "data_vendita, quantita, ricette(nome_ricetta, prezzo_vendita_netto), articoli(nome_articolo, prezzo_vendita_netto)"
         ).eq("id_sede", auth_data["id_sede"])\
          .gte("data_vendita", start_date)\
          .lte("data_vendita", end_date)\
@@ -166,9 +166,9 @@ async def export_vendite(
                 nome_prodotto = item["ricette"].get("nome_ricetta", "N/D")
                 prezzo_unitario = item["ricette"].get("prezzo_vendita_netto", 0.0)
             # Gestione prodotto commerciale (Rivendita)
-            elif item.get("anagrafica_rivendita") and item["anagrafica_rivendita"]:
-                nome_prodotto = item["anagrafica_rivendita"].get("nome_articolo", "N/D")
-                prezzo_unitario = item["anagrafica_rivendita"].get("prezzo_vendita_netto", 0.0)
+            elif item.get("articoli") and item["articoli"]:
+                nome_prodotto = item["articoli"].get("nome_articolo", "N/D")
+                prezzo_unitario = item["articoli"].get("prezzo_vendita_netto", 0.0)
 
             quantita = item["quantita"]
             flat_data.append({

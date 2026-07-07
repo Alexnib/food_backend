@@ -42,7 +42,7 @@ async def get_overview(periodo: str = "this_month", custom_start: str = None, cu
 
         # 1. Recupera Vendite
         vendite_res = supabase.table("vendite").select(
-            "*, ricette(costo_ricetta_reale, prezzo_vendita_netto), anagrafica_rivendita(prezzo_vendita_netto, prezzo_acquisto_netto)"
+            "*, ricette(costo_ricetta_reale, prezzo_vendita_netto), articoli(prezzo_vendita_netto, prezzo_acquisto_netto)"
         ).eq("id_sede", id_sede).gte("data_vendita", data_inizio_globali).lt("data_vendita", data_fine_inclusiva).execute()
         vendite_data = vendite_res.data or []
 
@@ -109,9 +109,9 @@ async def get_overview(periodo: str = "this_month", custom_start: str = None, cu
             if v.get("ricette"):
                 ricavo_unitario = v["ricette"].get("prezzo_vendita_netto", 0)
                 costo_unitario = v["ricette"].get("costo_ricetta_reale", 0)
-            elif v.get("anagrafica_rivendita"):
-                ricavo_unitario = v["anagrafica_rivendita"].get("prezzo_vendita_netto", 0)
-                costo_unitario = v["anagrafica_rivendita"].get("prezzo_acquisto_netto", 0)
+            elif v.get("articoli"):
+                ricavo_unitario = v["articoli"].get("prezzo_vendita_netto", 0)
+                costo_unitario = v["articoli"].get("prezzo_acquisto_netto", 0)
 
             ricavo_tot = (ricavo_unitario * qta)
             costo_tot = (costo_unitario * qta)
@@ -194,7 +194,7 @@ async def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
 
         # 2. Recupera TUTTE le Vendite dell'anno con un JOIN pazzesco per prendere il costo e il prezzo di quel prodotto
         vendite_res = supabase.table("vendite").select(
-            "*, ricette(costo_ricetta_reale, prezzo_vendita_netto), anagrafica_rivendita(prezzo_vendita_netto, prezzo_acquisto_netto)"
+            "*, ricette(costo_ricetta_reale, prezzo_vendita_netto), articoli(prezzo_vendita_netto, prezzo_acquisto_netto)"
         ).eq("id_sede", id_sede).gte("data_vendita", f"{anno}-01-01").lt("data_vendita", f"{anno+1}-01-01").execute()
         vendite_data = vendite_res.data or []
 
@@ -232,9 +232,9 @@ async def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
                 ricavo_unitario = v["ricette"].get("prezzo_vendita_netto", 0)
                 costo_unitario = v["ricette"].get("costo_ricetta_reale", 0)
             # Se è un prodotto commerciale (coca cola, patatine, ecc.)
-            elif v.get("anagrafica_rivendita"):
-                ricavo_unitario = v["anagrafica_rivendita"].get("prezzo_vendita_netto", 0)
-                costo_unitario = v["anagrafica_rivendita"].get("prezzo_acquisto_netto", 0)
+            elif v.get("articoli"):
+                ricavo_unitario = v["articoli"].get("prezzo_vendita_netto", 0)
+                costo_unitario = v["articoli"].get("prezzo_acquisto_netto", 0)
 
             if am in report:
                 report[am]["Ricavi"] += (ricavo_unitario * qta)
@@ -315,8 +315,8 @@ async def get_food_cost_analytics(
         # --- 1. Recupera vendite con JOIN completo ---
         vendite_res = supabase.table("vendite").select(
             "quantita, data_vendita, "
-            "ricette(id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, ingredienti_ricetta(quantita_per_kg, perc_scarto, anagrafica_materia_prima(articolo, prezzo_acquisto_netto))), "
-            "anagrafica_rivendita(id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto, id_categoria_prodotto)"
+            "ricette(id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(nome_articolo, prezzo_acquisto_netto))), "
+            "articoli(id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto, id_categoria_prodotto)"
         ).eq("id_sede", id_sede).gte("data_vendita", data_inizio_str).lt("data_vendita", data_fine_inclusiva).execute()
         vendite_data = vendite_res.data or []
 
@@ -357,7 +357,7 @@ async def get_food_cost_analytics(
             ingredienti_ricetta = []
 
             ricetta = v.get("ricette")
-            riv = v.get("anagrafica_rivendita")
+            riv = v.get("articoli")
 
             if ricetta:
                 ricavo_u = ricetta.get("prezzo_vendita_netto", 0) or 0
@@ -398,8 +398,8 @@ async def get_food_cost_analytics(
 
             # Ingredienti (solo per prodotti del menu con ricette)
             for ing in ingredienti_ricetta:
-                mp = ing.get("anagrafica_materia_prima") or {}
-                nome_ing = mp.get("articolo", "N/D")
+                mp = ing.get("articoli") or {}
+                nome_ing = mp.get("nome_articolo", "N/D")
                 costo_netto_mp = mp.get("prezzo_acquisto_netto", 0) or 0
                 qta_per_kg = ing.get("quantita_per_kg", 0) or 0
                 perc_scarto = ing.get("perc_scarto", 0) or 0
@@ -512,7 +512,7 @@ async def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
         pf_res = supabase.table("ricette").select(
             "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, "
             "ingredienti_ricetta(quantita_per_kg, perc_scarto, "
-            "anagrafica_materia_prima(articolo, prezzo_acquisto_netto, unita_misura))"
+            "articoli(nome_articolo, prezzo_acquisto_netto, unita_misura))"
         ).eq("id_sede", id_sede).execute()
 
         result = []
@@ -526,7 +526,7 @@ async def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
 
             ingredienti = []
             for ing in (ricetta.get("ingredienti_ricetta") or []):
-                mp = ing.get("anagrafica_materia_prima") or {}
+                mp = ing.get("articoli") or {}
                 costo_netto = mp.get("prezzo_acquisto_netto", 0) or 0
                 unita = mp.get("unita_misura", "kg")
                 qta_base = ing.get("quantita_per_kg", 0) or 0
@@ -539,7 +539,7 @@ async def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
                 perc_sul_prezzo = round((costo_ing / prezzo * 100) if prezzo > 0 else 0.0, 2)
 
                 ingredienti.append({
-                    "nome": mp.get("articolo", "N/D"),
+                    "nome": mp.get("nome_articolo", "N/D"),
                     "unita_misura": unita,
                     "costo_per_unita": round(costo_netto, 4),
                     "quantita_base": round(qta_base, 4),

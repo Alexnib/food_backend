@@ -93,9 +93,9 @@ async def scan_receipts(
         "id, ricette(nome_ricetta)"
     ).eq("id_sede", auth_data["id_sede"]).execute()
 
-    commerciali_res = supabase.table("anagrafica_rivendita").select(
+    commerciali_res = supabase.table("articoli").select(
         "id, nome_articolo"
-    ).eq("id_sede", auth_data["id_sede"]).execute()
+    ).eq("is_rivendita", True).eq("id_sede", auth_data["id_sede"]).execute()
 
     menu = []
     menu_lookup = {}

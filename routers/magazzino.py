@@ -63,71 +63,49 @@ async def delete_categoria(id: int, auth_data = Depends(get_user_sede)):
     return {"message": "Categoria eliminata"}
 
 # ==========================================
-# MATERIE PRIME
+# ARTICOLI (Acquisti, Materie Prime e Rivendita)
 # ==========================================
-@router.post("/materie-prime", status_code=status.HTTP_201_CREATED)
-async def create_materia_prima(data: MateriaPrimaCreate, auth_data = Depends(get_user_sede)):
-    insert_data = data.model_dump(mode="json")
-    insert_data["id_sede"] = auth_data["id_sede"]
-    res = supabase.table("anagrafica_materia_prima").insert(insert_data).execute()
-    return res.data[0]
-
-@router.get("/materie-prime")
-async def get_materie_prime(auth_data = Depends(get_user_sede)):
-    res = supabase.table("anagrafica_materia_prima").select("*").eq("id_sede", auth_data["id_sede"]).execute()
-    return res.data
-
-@router.put("/materie-prime/{id}")
-async def update_materia_prima(id: str, data: MateriaPrimaUpdate, auth_data = Depends(get_user_sede)):
-    update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
-    res = supabase.table("anagrafica_materia_prima").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
-    return res.data[0] if res.data else None
-
-@router.delete("/materie-prime/{id}")
-async def delete_materia_prima(id: str, auth_data = Depends(get_user_sede)):
-    res = supabase.table("anagrafica_materia_prima").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
-    return {"message": "Materia prima eliminata"}
-
-# ==========================================
-# ANAGRAFICA RIVENDITA (Prodotti Commerciali)
-# ==========================================
-@router.post("/rivendita", status_code=status.HTTP_201_CREATED)
-async def create_rivendita(data: ProdottoRivenditaCreate, auth_data = Depends(get_user_sede)):
+@router.post("/articoli", status_code=status.HTTP_201_CREATED)
+async def create_articolo(data: ArticoloCreate, auth_data = Depends(get_user_sede)):
     insert_data = data.model_dump(mode="json")
     insert_data["id_sede"] = auth_data["id_sede"]
     
-    # Calcolo automatico dei margini usando i prezzi netti
-    margine, margine_perc = calcola_margini(insert_data["prezzo_vendita_netto"], insert_data["prezzo_acquisto_netto"])
-    insert_data["margine"] = margine
-    insert_data["margine_perc"] = margine_perc
+    # Calcolo automatico dei margini usando i prezzi netti, SOLO se è rivendita
+    if insert_data.get("is_rivendita"):
+        margine, margine_perc = calcola_margini(insert_data["prezzo_vendita_netto"], insert_data["prezzo_acquisto_netto"])
+        insert_data["margine"] = margine
+        insert_data["margine_perc"] = margine_perc
+    else:
+        insert_data["margine"] = 0
+        insert_data["margine_perc"] = 0
 
-    res = supabase.table("anagrafica_rivendita").insert(insert_data).execute()
+    res = supabase.table("articoli").insert(insert_data).execute()
     return res.data[0]
 
-@router.get("/rivendita")
-async def get_rivendita(auth_data = Depends(get_user_sede)):
-    res = supabase.table("anagrafica_rivendita").select("*, categoria_prodotti(nome_categoria)").eq("id_sede", auth_data["id_sede"]).execute()
+@router.get("/articoli")
+async def get_articoli(auth_data = Depends(get_user_sede)):
+    res = supabase.table("articoli").select("*, categoria_prodotti(nome_categoria)").eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
-@router.put("/rivendita/{id}")
-async def update_rivendita(id: str, data: ProdottoRivenditaUpdate, auth_data = Depends(get_user_sede)):
+@router.put("/articoli/{id}")
+async def update_articolo(id: str, data: ArticoloUpdate, auth_data = Depends(get_user_sede)):
     update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
     
-    # Ricalcola i margini se uno dei due prezzi netti viene modificato
-    if "prezzo_vendita_netto" in update_data or "prezzo_acquisto_netto" in update_data:
-        # Recupera il prodotto attuale per i valori non modificati
-        old_data = supabase.table("anagrafica_rivendita").select("prezzo_vendita_netto, prezzo_acquisto_netto").eq("id", id).execute()
-        if old_data.data:
-            pv = update_data.get("prezzo_vendita_netto", old_data.data[0]["prezzo_vendita_netto"])
-            fc = update_data.get("prezzo_acquisto_netto", old_data.data[0]["prezzo_acquisto_netto"])
+    # Ricalcola i margini se cambiano
+    old_data = supabase.table("articoli").select("prezzo_vendita_netto, prezzo_acquisto_netto, is_rivendita").eq("id", id).execute()
+    if old_data.data:
+        is_rivendita = update_data.get("is_rivendita", old_data.data[0].get("is_rivendita"))
+        if is_rivendita:
+            pv = update_data.get("prezzo_vendita_netto", old_data.data[0].get("prezzo_vendita_netto") or 0)
+            fc = update_data.get("prezzo_acquisto_netto", old_data.data[0].get("prezzo_acquisto_netto") or 0)
             margine, margine_perc = calcola_margini(pv, fc)
             update_data["margine"] = margine
             update_data["margine_perc"] = margine_perc
 
-    res = supabase.table("anagrafica_rivendita").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+    res = supabase.table("articoli").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
     return res.data[0] if res.data else None
 
-@router.delete("/rivendita/{id}")
-async def delete_rivendita(id: str, auth_data = Depends(get_user_sede)):
-    res = supabase.table("anagrafica_rivendita").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
-    return {"message": "Prodotto eliminato"}
+@router.delete("/articoli/{id}")
+async def delete_articolo(id: str, auth_data = Depends(get_user_sede)):
+    res = supabase.table("articoli").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+    return {"message": "Articolo eliminato"}

@@ -6,13 +6,13 @@ class VenditaCreate(BaseModel):
     quantita: float
     data_vendita: date
     id_ricetta: Optional[str] = None
-    id_prodotto_commerciale: Optional[str] = None
+    id_articolo: Optional[str] = None
 
 class VenditaUpdate(BaseModel):
     quantita: Optional[float] = None
     data_vendita: Optional[date] = None
     id_ricetta: Optional[str] = None
-    id_prodotto_commerciale: Optional[str] = None
+    id_articolo: Optional[str] = None
 
 class VenditaBulkItem(BaseModel):
     """Singola riga di vendita nell'array bulk proveniente dall'AI Scanner."""
