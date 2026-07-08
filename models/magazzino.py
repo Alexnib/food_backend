@@ -43,7 +43,7 @@ class ArticoloUpdate(BaseModel):
 
 class ImportedProduct(BaseModel):
     nome_prodotto: str = Field(description="Il nome del prodotto pulito")
-    tipo: str = Field(description="Deve essere rigorosamente 'Materia Prima' oppure 'Rivendita'")
+    tipo: str = Field(description="Deve essere rigorosamente 'Materia Prima', 'Rivendita' oppure 'Entrambi'")
     unita_misura: str = Field(description="L'unità di misura, es. kg, lt, pz, gr")
     costo_netto: float = Field(description="Il costo al netto dell'IVA (float)")
     iva_perc: int = Field(description="La percentuale di IVA (es. 4, 10, 22 o 0)")

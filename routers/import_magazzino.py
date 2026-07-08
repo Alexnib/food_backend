@@ -62,6 +62,25 @@ async def save_imported_products(request: SaveImportRequest, auth_data = Depends
                 "is_materia_prima": True,
                 "is_rivendita": False
             })
+        elif item.tipo == "Entrambi":
+            articoli_to_insert.append({
+                "id_sede": id_sede,
+                "nome_articolo": item.nome_prodotto,
+                "unita_misura": item.unita_misura,
+                "prezzo_acquisto_netto": item.costo_netto,
+                "prezzo_acquisto_lordo": item.costo_lordo,
+                "prezzo_vendita_netto": 0.0,
+                "prezzo_vendita_lordo": 0.0,
+                "margine": 0.0,
+                "margine_perc": 0.0,
+                "id_iva_acquisto": id_iva,
+                "id_iva_rivendita": id_iva,
+                "id_categoria_prodotto": item.id_categoria,
+                "is_materia_prima": True,
+                "is_rivendita": True,
+                "fornitore": "Sconosciuto",
+                "anno": anno_corrente
+            })
         elif item.tipo == "Rivendita":
             articoli_to_insert.append({
                 "id_sede": id_sede,

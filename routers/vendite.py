@@ -74,7 +74,7 @@ async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_
 async def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
     try:
         # Validazione base: deve esserci almeno uno dei due prodotti
-        if not data.id_ricetta and not data.id_articolo:
+        if not data.id_ricetta and not data.id_prodotto_commerciale:
             raise HTTPException(status_code=400, detail="Devi specificare quale prodotto è stato venduto.")
 
         # Controlla se esiste già una vendita per questo prodotto in questa data per questa sede
@@ -82,7 +82,7 @@ async def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sed
         if data.id_ricetta:
             query = query.eq("id_ricetta", data.id_ricetta)
         else:
-            query = query.eq("id_articolo", data.id_articolo)
+            query = query.eq("id_prodotto_commerciale", data.id_prodotto_commerciale)
             
         existing = query.execute()
         

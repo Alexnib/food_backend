@@ -3,7 +3,7 @@ from typing import Optional, List
 
 # --- INGREDIENTI (Da inserire dentro la ricetta) ---
 class IngredienteRicettaItem(BaseModel):
-    id_articolo: str
+    id_materia_prima: str
     quantita_per_kg: float
     perc_scarto: float = 0.0
 
