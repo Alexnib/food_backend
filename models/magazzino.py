@@ -24,7 +24,6 @@ class ArticoloCreate(BaseModel):
     prezzo_vendita_netto: float = 0.0
     id_iva_rivendita: Optional[int] = None
     id_categoria_prodotto: Optional[int] = None
-    stock: Optional[int] = None
 
 class ArticoloUpdate(BaseModel):
     nome_articolo: Optional[str] = None
@@ -41,7 +40,6 @@ class ArticoloUpdate(BaseModel):
     prezzo_vendita_netto: Optional[float] = None
     id_iva_rivendita: Optional[int] = None
     id_categoria_prodotto: Optional[int] = None
-    stock: Optional[int] = None
 
 class ImportedProduct(BaseModel):
     nome_prodotto: str = Field(description="Il nome del prodotto pulito")
