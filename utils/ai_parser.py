@@ -99,3 +99,128 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
                 raise ValueError(f"Errore parsing JSON nel blocco {i}: {str(e)}")
 
     return json.dumps({"prodotti": all_products})
+
+async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: str):
+    """
+    Legge il file excel o csv delle vendite, lo converte in testo e lo invia a Gemini.
+    Estrae il nome del prodotto, la quantità venduta e la data di vendita.
+    Restituisce un generatore asincrono (yield) con aggiornamenti di progresso e il risultato finale.
+    """
+    import pandas as pd
+    import io
+    import os
+    import json
+    import asyncio
+    from google import genai
+    from google.genai import types
+    from models.vendite import ParsedVenditaResult
+
+    try:
+        if filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(excel_file_bytes))
+        else:
+            df = pd.read_excel(io.BytesIO(excel_file_bytes))
+    except Exception as e:
+        raise ValueError(f"Errore nella lettura del file: {str(e)}")
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY non configurata.")
+
+    # Uso del client asincrono
+    client = genai.Client(api_key=api_key)
+    
+    all_vendite = []
+    chunk_size = 50
+    total_rows = len(df)
+    total_chunks = (total_rows + chunk_size - 1) // chunk_size
+
+    # Semaphoro per limitare il numero di richieste contemporanee a Gemini (es. max 5)
+    sem = asyncio.Semaphore(5)
+
+    async def process_chunk(idx, start_row):
+        chunk_df = df.iloc[start_row : start_row + chunk_size]
+        csv_string = chunk_df.to_csv(index=False)
+        
+        prompt = f"""
+Sei un assistente esperto in analisi dati per la ristorazione.
+Ti sto fornendo un file CSV (o estratto di Excel) caricato da un ristoratore contenente le vendite dei prodotti.
+Potrebbe essere disordinato, avere colonne senza nome o avere formati di data vari.
+
+Il tuo compito è estrarre l'elenco delle vendite e restituirlo come un JSON che rispetti questo schema rigorosamente:
+{{
+  "vendite": [
+    {{
+      "nome_prodotto_estratto": "Nome del prodotto venduto",
+      "quantita": 10.5,
+      "data_vendita": "YYYY-MM-DD"
+    }}
+  ]
+}}
+
+Regole:
+1. 'nome_prodotto_estratto': Estrai o deduci chiaramente il nome del prodotto.
+2. 'quantita': Numero intero o decimale rappresentante la quantità venduta.
+3. 'data_vendita': Trasforma qualsiasi formato di data presente nel file nel formato ISO "YYYY-MM-DD" (es: 2026-07-13). Se non è presente una data in una riga, cerca di dedurla dalle righe precedenti.
+4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA del file CSV fornitoti. Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide nel CSV.
+
+Restituisci SOLO il JSON valido. Nessun commento o markdown.
+"""
+        max_retries = 3
+        chunk_result = None
+
+        async with sem:
+            for attempt in range(max_retries):
+                try:
+                    response = await client.aio.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=[
+                            prompt,
+                            f"Dati caricati:\n```csv\n{csv_string}\n```"
+                        ],
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            max_output_tokens=8192,
+                            response_mime_type="application/json",
+                            response_schema=ParsedVenditaResult,
+                        )
+                    )
+                    chunk_result = response.text
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    raise ValueError(f"Errore AI dopo {max_retries} tentativi nel blocco {idx}: {str(e)}")
+
+        if chunk_result:
+            try:
+                parsed_chunk = json.loads(chunk_result)
+                return parsed_chunk.get("vendite", [])
+            except Exception as e:
+                # Se per caso si è interrotto comunque, proviamo a recuperare le vendite valide col regex o falliamo
+                raise ValueError(f"Errore parsing JSON nel blocco {idx}: {str(e)}\nOutput troncato: {chunk_result[:100]}...")
+        return []
+
+    # Creazione dei task
+    tasks = []
+    for idx, i in enumerate(range(0, total_rows, chunk_size)):
+        tasks.append(process_chunk(idx, i))
+
+    completed_chunks = 0
+    # Aspettiamo il completamento man mano che finiscono
+    for future in asyncio.as_completed(tasks):
+        vendite = await future
+        all_vendite.extend(vendite)
+        completed_chunks += 1
+        
+        # Invio evento di progresso
+        progress_pct = int((completed_chunks / total_chunks) * 100)
+        yield json.dumps({"progress": progress_pct}) + "\n"
+
+    final_json = json.dumps({"vendite": all_vendite})
+    # Validazione Pydantic
+    ParsedVenditaResult.model_validate_json(final_json)
+    
+    # Invio evento di completamento e risultato finale
+    yield json.dumps({"result": {"vendite": all_vendite}}) + "\n"

@@ -21,52 +21,97 @@ async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_
         if not data.items:
             raise HTTPException(status_code=400, detail="Nessun item da salvare.")
 
-        # Step 1: Aggrega gli item in ingresso per data e prodotto
-        aggregated_items = {}
-        for item in data.items:
-            # Create a unique key for each group
-            key = f"{item.data_vendita.isoformat()}_{item.id_tipo}_{item.id_prodotto_menu}"
-            if key in aggregated_items:
-                aggregated_items[key].quantita += item.quantita
-            else:
-                import copy
-                aggregated_items[key] = copy.deepcopy(item)
 
-        # Step 2: Elabora ciascun item aggregato contro il database
-        results = []
-        for key, item in aggregated_items.items():
+        # 1. Raggruppa i dati in memoria per data_vendita e id prodotto
+        # e separa vendite sospese dalle vendite valide
+        vendite_sospese_to_insert = []
+        valid_vendite_grouped = {} # chiave: (data_vendita_iso, id_ricetta, id_commerciale), valore: quantita
+        
+        for item in data.items:
             data_vendita_iso = item.data_vendita.isoformat()
-            id_ricetta = item.id_prodotto_menu if item.id_tipo == "finito" else None
-            id_commerciale = item.id_prodotto_menu if item.id_tipo == "commerciale" else None
             
-            # Cerca record esistente
-            query = supabase.table("vendite").select("*").eq("id_sede", auth_data["id_sede"]).eq("data_vendita", data_vendita_iso)
-            if id_ricetta:
-                query = query.eq("id_ricetta", id_ricetta)
-            elif id_commerciale:
-                query = query.eq("id_articolo", id_commerciale)
-                
-            existing = query.execute()
-            
-            if existing.data and len(existing.data) > 0:
-                # Update
-                existing_record = existing.data[0]
-                new_quantita = existing_record["quantita"] + item.quantita
-                res = supabase.table("vendite").update({"quantita": new_quantita}).eq("id", existing_record["id"]).execute()
-                results.append(res.data[0])
-            else:
-                # Insert
-                record = {
+            if item.id_tipo == "sospeso":
+                vendite_sospese_to_insert.append({
                     "data_vendita": data_vendita_iso,
                     "quantita": item.quantita,
                     "id_sede": auth_data["id_sede"],
-                    "id_ricetta": id_ricetta,
-                    "id_articolo": id_commerciale,
-                }
-                res = supabase.table("vendite").insert(record).execute()
-                results.append(res.data[0])
+                    "nome_vendita": item.nome_vendita or "Sconosciuto"
+                })
+                continue
+                
+            id_ricetta = item.id_prodotto_menu if item.id_tipo == "finito" else None
+            id_commerciale = item.id_prodotto_menu if item.id_tipo == "commerciale" else None
+            
+            key = (data_vendita_iso, id_ricetta, id_commerciale)
+            if key in valid_vendite_grouped:
+                valid_vendite_grouped[key] += item.quantita
+            else:
+                valid_vendite_grouped[key] = item.quantita
+                
+        results = []
+        
+        # 2. Inserisci le vendite sospese in bulk
+        if vendite_sospese_to_insert:
+            chunk_size = 500
+            for i in range(0, len(vendite_sospese_to_insert), chunk_size):
+                chunk = vendite_sospese_to_insert[i:i+chunk_size]
+                res = supabase.table("vendite_sospese").insert(chunk).execute()
+                results.extend(res.data)
+                
+        # 3. Gestisci le vendite valide con bulk upsert
+        if valid_vendite_grouped:
+            dates = [k[0] for k in valid_vendite_grouped.keys()]
+            min_date = min(dates)
+            max_date = max(dates)
+            
+            existing_sales = []
+            page = 0
+            page_size = 1000
+            while True:
+                res = supabase.table("vendite").select("*").eq("id_sede", auth_data["id_sede"]).gte("data_vendita", min_date).lte("data_vendita", max_date).range(page * page_size, (page + 1) * page_size - 1).execute()
+                if not res.data:
+                    break
+                existing_sales.extend(res.data)
+                if len(res.data) < page_size:
+                    break
+                page += 1
+                
+            existing_sales_dict = {}
+            for sale in existing_sales:
+                key = (sale["data_vendita"], sale.get("id_ricetta"), sale.get("id_prodotto_commerciale"))
+                existing_sales_dict[key] = sale
+                
+            vendite_to_upsert = []
+            for key, quantita in valid_vendite_grouped.items():
+                data_vendita, id_ricetta, id_commerciale = key
+                if key in existing_sales_dict:
+                    sale = existing_sales_dict[key]
+                    vendite_to_upsert.append({
+                        "id": sale["id"],
+                        "data_vendita": data_vendita,
+                        "quantita": sale["quantita"] + quantita,
+                        "id_sede": auth_data["id_sede"],
+                        "id_ricetta": id_ricetta,
+                        "id_prodotto_commerciale": id_commerciale
+                    })
+                else:
+                    vendite_to_upsert.append({
+                        "data_vendita": data_vendita,
+                        "quantita": quantita,
+                        "id_sede": auth_data["id_sede"],
+                        "id_ricetta": id_ricetta,
+                        "id_prodotto_commerciale": id_commerciale
+                    })
+                    
+            if vendite_to_upsert:
+                chunk_size = 500
+                for i in range(0, len(vendite_to_upsert), chunk_size):
+                    chunk = vendite_to_upsert[i:i+chunk_size]
+                    res = supabase.table("vendite").upsert(chunk).execute()
+                    if res.data:
+                        results.extend(res.data)
 
-        return {"message": f"{len(results)} vendite processate con successo.", "data": results}
+        return {"message": f"{len(results)} voci processate (raggruppate) con successo.", "data": results}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -116,13 +161,100 @@ async def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@router.get("/")
-async def get_vendite(auth_data = Depends(get_user_sede)):
-    # Recupera le vendite unendo i nomi delle ricette e dei prodotti commerciali per comodità visiva
-    res = supabase.table("vendite").select(
-        "*, ricette(nome_ricetta), articoli(nome_articolo)"
-    ).eq("id_sede", auth_data["id_sede"]).execute()
+@router.get("/summary")
+async def get_vendite_summary(auth_data = Depends(get_user_sede)):
+    """Restituisce il riepilogo delle vendite raggruppato per mese (YYYY-MM)."""
+    res = supabase.table("vendite").select("data_vendita, quantita").eq("id_sede", auth_data["id_sede"]).execute()
+    data = res.data
+    
+    summary = {}
+    for item in data:
+        # data_vendita è ISO 8601 (es: 2026-06-15)
+        if not item.get("data_vendita"): continue
+        month = item["data_vendita"][:7] # YYYY-MM
+        if month not in summary:
+            summary[month] = {"mese": month, "numero_operazioni": 0, "quantita_totale": 0}
+        
+        summary[month]["numero_operazioni"] += 1
+        summary[month]["quantita_totale"] += item.get("quantita", 0)
+        
+    # Ordina per mese decrescente (i più recenti prima)
+    result_list = sorted(list(summary.values()), key=lambda x: x["mese"], reverse=True)
+    return result_list
+
+from typing import Optional
+import calendar
+
+@router.get("/sospese")
+async def get_vendite_sospese(auth_data = Depends(get_user_sede)):
+    res = supabase.table("vendite_sospese").select("*").eq("id_sede", auth_data["id_sede"]).order("created_at", desc=True).execute()
     return res.data
+
+@router.delete("/sospese/{id}")
+async def delete_vendita_sospesa(id: str, auth_data = Depends(get_user_sede)):
+    res = supabase.table("vendite_sospese").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Vendita sospesa non trovata o non autorizzato.")
+    return {"message": "Vendita sospesa eliminata"}
+
+@router.post("/sospese/{id}/resolve")
+async def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = Depends(get_user_sede)):
+    try:
+        # Recupera la vendita sospesa
+        res = supabase.table("vendite_sospese").select("*").eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Vendita sospesa non trovata.")
+        
+        sospesa = res.data[0]
+        
+        # Crea la vendita reale
+        record = {
+            "data_vendita": sospesa["data_vendita"],
+            "quantita": sospesa["quantita"],
+            "id_sede": auth_data["id_sede"],
+            "id_ricetta": data.id_ricetta,
+            "id_prodotto_commerciale": data.id_prodotto_commerciale,
+        }
+        
+        # Inserisci in vendite
+        supabase.table("vendite").insert(record).execute()
+        
+        # Elimina da vendite_sospese
+        supabase.table("vendite_sospese").delete().eq("id", id).execute()
+        
+        return {"message": "Vendita risolta con successo"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/")
+async def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_sede)):
+    # Recupera le vendite unendo i nomi delle ricette e dei prodotti commerciali per comodità visiva
+    query = supabase.table("vendite").select(
+        "*, ricette(nome_ricetta), articoli(nome_articolo)"
+    ).eq("id_sede", auth_data["id_sede"])
+    
+    if month:
+        y, m = map(int, month.split('-'))
+        last_day = calendar.monthrange(y, m)[1]
+        start_date = f"{month}-01"
+        end_date = f"{month}-{last_day}"
+        query = query.gte("data_vendita", start_date).lte("data_vendita", end_date)
+        
+    # Paginazione per superare il limite di 1000 righe di Supabase
+    all_data = []
+    page = 0
+    page_size = 1000
+    while True:
+        res = query.range(page * page_size, (page + 1) * page_size - 1).execute()
+        if not res.data:
+            break
+        all_data.extend(res.data)
+        if len(res.data) < page_size:
+            break
+        page += 1
+        
+    return all_data
 
 @router.delete("/{id}")
 async def elimina_vendita(id: int, auth_data = Depends(get_user_sede)):
@@ -225,3 +357,25 @@ async def export_vendite(
         print(f"Excel Export Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+from fastapi import UploadFile, File
+from fastapi.responses import StreamingResponse
+from utils.ai_parser import parse_vendite_excel_with_ai_stream
+
+@router.post("/import/upload")
+async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(get_user_sede)):
+    """
+    Riceve il file Excel/CSV, lo legge e lo invia a Gemini per l'estrazione delle vendite.
+    Ritorna uno stream NDJSON per aggiornamenti di progresso progressivi e il risultato finale.
+    """
+    content = await file.read()
+    filename = file.filename
+    
+    async def event_generator():
+        try:
+            async for chunk in parse_vendite_excel_with_ai_stream(content, filename):
+                yield chunk
+        except Exception as e:
+            import json
+            yield json.dumps({"error": str(e)}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
