@@ -8,7 +8,7 @@ supabase = Database.get_client()
 
 
 @router.post("/ricette", status_code=status.HTTP_201_CREATED)
-async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
+def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
     try:
         # 1. Creiamo il "contenitore" della ricetta (costo temporaneo 0)
         ricetta_insert = {
@@ -78,7 +78,7 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/ricette")
-async def get_ricette(auth_data = Depends(get_user_sede)):
+def get_ricette(auth_data = Depends(get_user_sede)):
     # Restituiamo le ricette e includiamo in automatico i loro ingredienti nidificati e categorie!
     # Paginazione interna per recuperare SEMPRE tutte le righe, anche oltre il cap di righe di
     # PostgREST/Supabase su una singola query (~1000), stesso pattern usato in routers/vendite.py.
@@ -99,7 +99,7 @@ async def get_ricette(auth_data = Depends(get_user_sede)):
     return tutte_le_ricette
 
 @router.put("/ricette/{id}")
-async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_sede)):
+def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_sede)):
     try:
         # 1. Elimina vecchi ingredienti
         supabase.table("ingredienti_ricetta").delete().eq("id_ricetta", id).execute()
@@ -148,7 +148,7 @@ async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_u
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.delete("/ricette/{id}")
-async def delete_ricetta(id: str, auth_data = Depends(get_user_sede)):
+def delete_ricetta(id: str, auth_data = Depends(get_user_sede)):
     try:
         supabase.table("ingredienti_ricetta").delete().eq("id_ricetta", id).execute()
         res = supabase.table("ricette").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()

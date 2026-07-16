@@ -8,7 +8,7 @@ router = APIRouter(prefix="/api/statistiche", tags=["Statistiche e P&L"])
 supabase = Database.get_client()
 
 @router.get("/overview")
-async def get_overview(periodo: str = "this_month", custom_start: str = None, custom_end: str = None, auth_data = Depends(get_user_sede)):
+def get_overview(periodo: str = "this_month", custom_start: str = None, custom_end: str = None, auth_data = Depends(get_user_sede)):
     try:
         id_sede = auth_data["id_sede"]
 
@@ -173,7 +173,7 @@ async def get_overview(periodo: str = "this_month", custom_start: str = None, cu
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/controllo-gestione/{anno}")
-async def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
+def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
     try:
         id_sede = auth_data["id_sede"]
 
@@ -243,7 +243,7 @@ async def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
 # FOOD COST ANALYTICS
 # ==========================================
 @router.get("/food-cost")
-async def get_food_cost_analytics(
+def get_food_cost_analytics(
     periodo: str = "last_30_days",
     custom_start: str = None,
     custom_end: str = None,
@@ -287,19 +287,63 @@ async def get_food_cost_analytics(
         data_fine_inclusiva = (data_fine_date + timedelta(days=1)).strftime("%Y-%m-%d")
         delta_days = (data_fine_date - data_inizio_date).days
 
-        # --- 1. Recupera vendite con JOIN completo ---
-        vendite_res = supabase.table("vendite").select(
-            "quantita, data_vendita, "
-            "ricette(id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(nome_articolo, prezzo_acquisto_netto))), "
-            "articoli(id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto, id_categoria_prodotto)"
-        ).eq("id_sede", id_sede).gte("data_vendita", data_inizio_str).lt("data_vendita", data_fine_inclusiva).execute()
-        vendite_data = vendite_res.data or []
+        # --- 1. Recupera le vendite del periodo (solo i campi essenziali, paginato:
+        # una vendita può facilmente superare le 1000 righe di default di Supabase). ---
+        vendite_data = []
+        page = 0
+        page_size = 1000
+        while True:
+            res = supabase.table("vendite").select(
+                "quantita, data_vendita, id_ricetta, id_prodotto_commerciale"
+            ).eq("id_sede", id_sede)\
+             .gte("data_vendita", data_inizio_str)\
+             .lt("data_vendita", data_fine_inclusiva)\
+             .range(page * page_size, (page + 1) * page_size - 1).execute()
+            if not res.data:
+                break
+            vendite_data.extend(res.data)
+            if len(res.data) < page_size:
+                break
+            page += 1
 
-        # --- 2. Recupera categorie per i nomi ---
+        # --- 2. Recupera UNA SOLA VOLTA i dati "anagrafici" di ricette e articoli
+        # (prezzo, costo, ingredienti), invece di rifare il join per ogni singola
+        # vendita: lo stesso prodotto venduto 500 volte in un mese scaricherebbe
+        # altrimenti 500 volte l'intero albero ingredienti_ricetta->articoli. ---
+        ricette_data = []
+        page = 0
+        while True:
+            res = supabase.table("ricette").select(
+                "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, "
+                "ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(nome_articolo, prezzo_acquisto_netto))"
+            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
+            if not res.data:
+                break
+            ricette_data.extend(res.data)
+            if len(res.data) < page_size:
+                break
+            page += 1
+        ricette_map = {r["id"]: r for r in ricette_data}
+
+        articoli_data = []
+        page = 0
+        while True:
+            res = supabase.table("articoli").select(
+                "id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto, id_categoria_prodotto"
+            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
+            if not res.data:
+                break
+            articoli_data.extend(res.data)
+            if len(res.data) < page_size:
+                break
+            page += 1
+        articoli_map = {a["id"]: a for a in articoli_data}
+
+        # --- 3. Recupera categorie per i nomi ---
         cat_res = supabase.table("categoria_prodotti").select("id, nome_categoria").eq("id_sede", id_sede).execute()
         categorie_map = {c["id"]: c["nome_categoria"] for c in (cat_res.data or [])}
 
-        # --- 3. Variabili di aggregazione ---
+        # --- 4. Variabili di aggregazione ---
         totale_ricavi = 0.0
         totale_food_cost = 0.0
 
@@ -318,7 +362,7 @@ async def get_food_cost_analytics(
         # Distribuzione per categoria { id_cat: { nome, ricavi, fc } }
         categorie_dict = {}
 
-        # --- 4. Elaborazione vendite ---
+        # --- 5. Elaborazione vendite ---
         for v in vendite_data:
             qta = v.get("quantita", 0)
             data_v = (v.get("data_vendita") or "")[:10]
@@ -331,8 +375,10 @@ async def get_food_cost_analytics(
             id_cat = None
             ingredienti_ricetta = []
 
-            ricetta = v.get("ricette")
-            riv = v.get("articoli")
+            id_ricetta = v.get("id_ricetta")
+            id_prodotto = v.get("id_prodotto_commerciale")
+            ricetta = ricette_map.get(id_ricetta) if id_ricetta is not None else None
+            riv = articoli_map.get(id_prodotto) if id_prodotto is not None else None
 
             if ricetta:
                 ricavo_u = ricetta.get("prezzo_vendita_netto", 0) or 0
@@ -472,7 +518,7 @@ async def get_food_cost_analytics(
 # RICETTE BREAKDOWN — Anatomia per prodotto
 # ==========================================
 @router.get("/ricette-breakdown")
-async def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
+def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
     """
     Restituisce per ogni prodotto finito il dettaglio completo degli ingredienti:
     - costo per ingrediente (con calcolo scarto)
@@ -483,16 +529,28 @@ async def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
     try:
         id_sede = auth_data["id_sede"]
 
-        # Recupera tutte le ricette con ingredienti in cascata
-        pf_res = supabase.table("ricette").select(
-            "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, "
-            "ingredienti_ricetta(quantita_per_kg, perc_scarto, "
-            "articoli(nome_articolo, prezzo_acquisto_netto, unita_misura))"
-        ).eq("id_sede", id_sede).execute()
+        # Recupera tutte le ricette con ingredienti in cascata (paginato per
+        # sicurezza, stesso pattern usato altrove per evitare il limite di
+        # default di Supabase sulle righe restituite)
+        pf_data = []
+        page = 0
+        page_size = 500
+        while True:
+            res = supabase.table("ricette").select(
+                "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, "
+                "ingredienti_ricetta(quantita_per_kg, perc_scarto, "
+                "articoli(nome_articolo, prezzo_acquisto_netto, unita_misura))"
+            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
+            if not res.data:
+                break
+            pf_data.extend(res.data)
+            if len(res.data) < page_size:
+                break
+            page += 1
 
         result = []
 
-        for ricetta in (pf_res.data or []):
+        for ricetta in pf_data:
             prezzo = ricetta.get("prezzo_vendita_netto", 0) or 0
             costo_ricetta = ricetta.get("costo_ricetta_reale", 0) or 0
             margine = round(prezzo - costo_ricetta, 4)

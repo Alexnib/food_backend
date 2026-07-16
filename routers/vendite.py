@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api/vendite", tags=["Vendite"])
 supabase = Database.get_client()
 
 @router.post("/bulk", status_code=status.HTTP_201_CREATED)
-async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_sede)):
+def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_sede)):
     """
     Salvataggio massivo proveniente dall'AI Scanner.
     Ogni item nell'array viene trasformato nel formato VenditaCreate e inserito nel DB.
@@ -116,7 +116,7 @@ async def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
-async def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
+def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
     try:
         # Validazione base: deve esserci almeno uno dei due prodotti
         if not data.id_ricetta and not data.id_prodotto_commerciale:
@@ -148,7 +148,7 @@ async def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sed
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.put("/{id}")
-async def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get_user_sede)):
+def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get_user_sede)):
     try:
         update_data = data.model_dump(exclude_unset=True, mode="json")
         if not update_data:
@@ -162,7 +162,7 @@ async def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/summary")
-async def get_vendite_summary(auth_data = Depends(get_user_sede)):
+def get_vendite_summary(auth_data = Depends(get_user_sede)):
     """Restituisce il riepilogo delle vendite raggruppato per mese (YYYY-MM)."""
     id_sede = auth_data["id_sede"]
 
@@ -198,7 +198,7 @@ from typing import Optional
 import calendar
 
 @router.get("/sospese")
-async def get_vendite_sospese(auth_data = Depends(get_user_sede)):
+def get_vendite_sospese(auth_data = Depends(get_user_sede)):
     id_sede = auth_data["id_sede"]
 
     # Paginazione per superare il limite di righe di Supabase (stesso pattern di GET "/")
@@ -217,14 +217,14 @@ async def get_vendite_sospese(auth_data = Depends(get_user_sede)):
     return data
 
 @router.delete("/sospese/{id}")
-async def delete_vendita_sospesa(id: str, auth_data = Depends(get_user_sede)):
+def delete_vendita_sospesa(id: str, auth_data = Depends(get_user_sede)):
     res = supabase.table("vendite_sospese").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Vendita sospesa non trovata o non autorizzato.")
     return {"message": "Vendita sospesa eliminata"}
 
 @router.post("/sospese/{id}/resolve")
-async def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = Depends(get_user_sede)):
+def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = Depends(get_user_sede)):
     try:
         # Recupera la vendita sospesa
         res = supabase.table("vendite_sospese").select("*").eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
@@ -254,7 +254,7 @@ async def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_dat
 
 
 @router.get("/")
-async def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_sede)):
+def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_sede)):
     # Recupera le vendite unendo i nomi delle ricette e dei prodotti commerciali per comodità visiva
     query = supabase.table("vendite").select(
         "*, ricette(nome_ricetta), articoli(nome_articolo)"
@@ -283,19 +283,19 @@ async def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_
     return all_data
 
 @router.delete("/{id}")
-async def elimina_vendita(id: int, auth_data = Depends(get_user_sede)):
+def elimina_vendita(id: int, auth_data = Depends(get_user_sede)):
     res = supabase.table("vendite").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
     return {"message": "Vendita annullata"}
 
 @router.post("/bulk-delete")
-async def bulk_delete_vendite(data: VenditaBulkDelete, auth_data = Depends(get_user_sede)):
+def bulk_delete_vendite(data: VenditaBulkDelete, auth_data = Depends(get_user_sede)):
     if not data.ids:
         return {"message": "Nessun id fornito."}
     res = supabase.table("vendite").delete().in_("id", data.ids).eq("id_sede", auth_data["id_sede"]).execute()
     return {"message": f"Vendite annullate"}
 
 @router.get("/export")
-async def export_vendite(
+def export_vendite(
     start_date: str, 
     end_date: str, 
     auth_data = Depends(get_user_sede)

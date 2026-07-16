@@ -15,7 +15,7 @@ router = APIRouter(
 supabase = Database.get_client()
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(user: UserRegister):
+def register(user: UserRegister):
     try:
         check_email = supabase.table("users").select("id").eq("email", user.email).execute()
         
@@ -53,7 +53,7 @@ async def register(user: UserRegister):
         raise HTTPException(status_code=400, detail=str(e))
     
 @router.post("/login")
-async def login(credentials: UserLogin):
+def login(credentials: UserLogin):
     # BLOCCO 1: Autenticazione (Supabase Auth)
     try:
         auth_res = supabase.auth.sign_in_with_password({
@@ -96,7 +96,7 @@ async def login(credentials: UserLogin):
         )
         
 @router.post("/refresh-token")
-async def refresh_token(data: RefreshTokenRequest):
+def refresh_token(data: RefreshTokenRequest):
     """
     Scambia un refresh_token valido con un nuovo access_token fresco.
     """
@@ -122,7 +122,7 @@ async def refresh_token(data: RefreshTokenRequest):
         )
         
 @router.get("/google/login")
-async def google_login():
+def google_login():
     """
     Endpoint per avviare il flusso OAuth2 di Google.
     Il frontend chiamerà questo URL per farsi reindirizzare alla pagina di consenso di Google.
@@ -141,7 +141,7 @@ async def google_login():
         raise HTTPException(status_code=500, detail=str(e))
     
 @router.post("/forgot-password")
-async def forgot_password(data: ForgotPassword):
+def forgot_password(data: ForgotPassword):
     """
     1. Richiesta di Reset Password (Pubblica).
     Invia un'email con un link univoco all'utente.
@@ -161,7 +161,7 @@ async def forgot_password(data: ForgotPassword):
         return {"message": "Se l'email è registrata, riceverai a breve un link per reimpostare la password."}
 
 @router.put("/me/password")
-async def update_password(data: UpdatePassword, current_user = Depends(get_current_user)):
+def update_password(data: UpdatePassword, current_user = Depends(get_current_user)):
     """
     2. Cambio Password (Protetta).
     Cambia la password dell'utente attualmente loggato.
@@ -180,7 +180,7 @@ async def update_password(data: UpdatePassword, current_user = Depends(get_curre
         raise HTTPException(status_code=400, detail=f"Errore durante il cambio password: {str(e)}")
 
 @router.put("/me")
-async def update_profile(data: UpdateUser, current_user = Depends(get_current_user)):
+def update_profile(data: UpdateUser, current_user = Depends(get_current_user)):
     """
     3. Modifica Dati Utente (Protetta).
     Aggiorna nome, cognome o telefono nella tabella pubblica.
@@ -209,7 +209,7 @@ async def update_profile(data: UpdateUser, current_user = Depends(get_current_us
         raise HTTPException(status_code=400, detail=f"Errore aggiornamento profilo: {str(e)}")
 
 @router.delete("/me")
-async def delete_account(current_user = Depends(get_current_user)):
+def delete_account(current_user = Depends(get_current_user)):
     try:
         # 🪄 CLIENT ISOLATO: Creiamo un client usa-e-getta con pieni poteri
         admin_client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))

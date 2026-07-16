@@ -13,7 +13,7 @@ MAPPATURA_MESI = {
 }
 
 @router.post("/categorie", status_code=status.HTTP_201_CREATED)
-async def create_categoria(data: CategoriaCostoCreate, auth_data = Depends(get_user_sede)):
+def create_categoria(data: CategoriaCostoCreate, auth_data = Depends(get_user_sede)):
     try:
         insert_data = data.model_dump(mode="json")
         insert_data["id_sede"] = auth_data["id_sede"]
@@ -24,7 +24,7 @@ async def create_categoria(data: CategoriaCostoCreate, auth_data = Depends(get_u
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/categorie", status_code=status.HTTP_200_OK)
-async def get_categorie(auth_data = Depends(get_user_sede)):
+def get_categorie(auth_data = Depends(get_user_sede)):
     try:
         res = supabase.table("categorie_costi").select("*").eq("id_sede", auth_data["id_sede"]).execute()
         return res.data
@@ -32,7 +32,7 @@ async def get_categorie(auth_data = Depends(get_user_sede)):
         raise HTTPException(status_code=500, detail=str(e))
     
 @router.put("/categorie/{id}", status_code=status.HTTP_200_OK)
-async def update_categoria(id: str, data: CategoriaCostoUpdate, auth_data = Depends(get_user_sede)):
+def update_categoria(id: str, data: CategoriaCostoUpdate, auth_data = Depends(get_user_sede)):
     try:
         update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
         if not update_data:
@@ -53,7 +53,7 @@ async def update_categoria(id: str, data: CategoriaCostoUpdate, auth_data = Depe
 
 
 @router.delete("/categorie/{id}", status_code=status.HTTP_200_OK)
-async def delete_categoria(id: str, auth_data = Depends(get_user_sede)):
+def delete_categoria(id: str, auth_data = Depends(get_user_sede)):
     try:
         # SICUREZZA: Elimina solo se l'ID coincide E se appartiene alla sede dell'utente
         res = supabase.table("categorie_costi").delete()\
@@ -73,7 +73,7 @@ async def delete_categoria(id: str, auth_data = Depends(get_user_sede)):
 # ---COSTI ANNO MESE---
 
 @router.post("/costi", status_code=status.HTTP_201_CREATED)
-async def create_costo(data: CostoAnnoMeseCreate, auth_data = Depends(get_user_sede)):
+def create_costo(data: CostoAnnoMeseCreate, auth_data = Depends(get_user_sede)):
     try:
         insert_data = data.model_dump(mode="json")
         insert_data["id_sede"] = auth_data["id_sede"]
@@ -91,7 +91,7 @@ async def create_costo(data: CostoAnnoMeseCreate, auth_data = Depends(get_user_s
         raise HTTPException(status_code=400, detail=str(e))
     
 @router.get("/costi", status_code=status.HTTP_200_OK)
-async def get_costi(auth_data = Depends(get_user_sede)):
+def get_costi(auth_data = Depends(get_user_sede)):
     try:
         res = supabase.table("costi_anno_mese").select("*, categorie_costi(*)").eq("id_sede", auth_data["id_sede"]).execute()
         return res.data
@@ -99,7 +99,7 @@ async def get_costi(auth_data = Depends(get_user_sede)):
         raise HTTPException(status_code=500, detail=str(e))
           
 @router.put("/costi/{id}", status_code=status.HTTP_200_OK)
-async def update_costo(id: str, data: CostoAnnoMeseUpdate, auth_data = Depends(get_user_sede)):
+def update_costo(id: str, data: CostoAnnoMeseUpdate, auth_data = Depends(get_user_sede)):
     try:
         update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
         if not update_data:
@@ -118,7 +118,7 @@ async def update_costo(id: str, data: CostoAnnoMeseUpdate, auth_data = Depends(g
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.delete("/costi/{id}", status_code=status.HTTP_200_OK)
-async def delete_costo(id: str, auth_data = Depends(get_user_sede)):
+def delete_costo(id: str, auth_data = Depends(get_user_sede)):
     try:
         res = supabase.table("costi_anno_mese").delete()\
             .eq("id", id)\

@@ -12,7 +12,7 @@ router = APIRouter(
 supabase = Database.get_client()
 
 @router.post("/negozi", status_code=status.HTTP_201_CREATED)
-async def create_negozio(data: CreateNegozio, current_user = Depends(get_current_user)):
+def create_negozio(data: CreateNegozio, current_user = Depends(get_current_user)):
     """Crea l'entità principale del Negozio (Brand)"""
     try:
         res = supabase.table("negozi").insert(data.model_dump(mode="json")).execute()
@@ -21,7 +21,7 @@ async def create_negozio(data: CreateNegozio, current_user = Depends(get_current
         raise HTTPException(status_code=400, detail=f"Errore creazione negozio: {str(e)}")
     
 @router.post("/sedi", status_code=status.HTTP_201_CREATED)
-async def create_sede(data: CreateSede, current_user = Depends(get_current_user)):
+def create_sede(data: CreateSede, current_user = Depends(get_current_user)):
     """Crea una sede fisica legata a un negozio specifico"""
     try:
         sede_res = supabase.table("sedi").insert(data.model_dump(mode="json")).execute()
@@ -42,7 +42,7 @@ async def create_sede(data: CreateSede, current_user = Depends(get_current_user)
         raise HTTPException(status_code=400, detail=f"Errore: {str(e)}")
     
 @router.get("/sedi", status_code=status.HTTP_200_OK)
-async def lista_sedi(id_negozio: UUID, current_user = Depends(get_current_user)):
+def lista_sedi(id_negozio: UUID, current_user = Depends(get_current_user)):
     """Recupera tutte le sedi con i dati del negozio associato (Join)"""
     try:
         res = supabase.from_("sedi").select("*, negozi(*)").eq("id_negozio", str(id_negozio)).execute()

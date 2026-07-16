@@ -30,7 +30,7 @@ async def upload_excel_for_import(file: UploadFile = File(...), auth_data = Depe
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/save")
-async def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_user_sede)):
+def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_user_sede)):
     id_sede = auth_data["id_sede"]
     
     # Ottieni la tabella IVA per fare il match
