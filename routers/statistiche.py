@@ -40,11 +40,15 @@ async def get_overview(periodo: str = "this_month", custom_start: str = None, cu
         data_fine = data_fine_date.strftime("%Y-%m-%d")
         data_fine_inclusiva = (data_fine_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 1. Recupera Vendite
-        vendite_res = supabase.table("vendite").select(
-            "*, ricette(costo_ricetta_reale, prezzo_vendita_netto), articoli(prezzo_vendita_netto, prezzo_acquisto_netto)"
-        ).eq("id_sede", id_sede).gte("data_vendita", data_inizio_globali).lt("data_vendita", data_fine_inclusiva).execute()
-        vendite_data = vendite_res.data or []
+        # 1. Recupera l'andamento delle vendite già aggregato lato DB (SUM/GROUP BY in Postgres),
+        # invece di scaricare ogni riga di vendita e sommarla in Python (vedi sql/001_stat_andamento_vendite.sql)
+        andamento_res = supabase.rpc("stat_andamento_vendite", {
+            "p_id_sede": id_sede,
+            "p_data_inizio": data_inizio_globali,
+            "p_data_fine_esclusiva": data_fine_inclusiva,
+            "p_group_by": "day" if is_daily else "month"
+        }).execute()
+        andamento_vendite = andamento_res.data or []
 
         # 2. Recupera Costi Fissi
         costi_res = supabase.table("costi_anno_mese").select("*").eq("id_sede", id_sede).execute()
@@ -90,40 +94,25 @@ async def get_overview(periodo: str = "this_month", custom_start: str = None, cu
                     curr_m = 1
                     curr_y += 1
 
-        # 4. Processamento vendite
+        # 4. Applica l'andamento aggregato (già filtrato per id_sede/periodo dalla funzione SQL,
+        # quindi ogni riga restituita rientra nell'intervallo richiesto)
         totale_ricavi = 0.0
         totale_food_cost = 0.0
         numero_ordini = 0
 
-        for v in vendite_data:
-            qta = v.get("quantita", 0)
-            data_v_raw = v.get("data_vendita")
-            if not data_v_raw: continue
-            
-            data_v = data_v_raw[:10]  # Prende solo YYYY-MM-DD ignorando eventuale tempo
-            chiave = data_v if is_daily else data_v[:7]
-            
-            ricavo_unitario = 0
-            costo_unitario = 0
+        for row in andamento_vendite:
+            chiave = row["periodo"]
+            ricavi_riga = row.get("ricavi") or 0.0
+            food_cost_riga = row.get("food_cost") or 0.0
+            ordini_riga = row.get("numero_vendite") or 0
 
-            if v.get("ricette"):
-                ricavo_unitario = v["ricette"].get("prezzo_vendita_netto", 0)
-                costo_unitario = v["ricette"].get("costo_ricetta_reale", 0)
-            elif v.get("articoli"):
-                ricavo_unitario = v["articoli"].get("prezzo_vendita_netto", 0)
-                costo_unitario = v["articoli"].get("prezzo_acquisto_netto", 0)
-
-            ricavo_tot = (ricavo_unitario * qta)
-            costo_tot = (costo_unitario * qta)
-            
             if chiave in andamento_dict:
-                andamento_dict[chiave]["ricavi"] += ricavo_tot
-                andamento_dict[chiave]["food_cost"] += costo_tot
+                andamento_dict[chiave]["ricavi"] += ricavi_riga
+                andamento_dict[chiave]["food_cost"] += food_cost_riga
 
-            if data_inizio_globali <= data_v <= data_fine:
-                totale_ricavi += ricavo_tot
-                totale_food_cost += costo_tot
-                numero_ordini += 1
+            totale_ricavi += ricavi_riga
+            totale_food_cost += food_cost_riga
+            numero_ordini += ordini_riga
 
         # 5. Metriche Globali
         totale_costi_generali = sum(item["costi_fissi"] for item in andamento_dict.values() if item["data"] >= data_inizio_globali and item["data"] <= data_fine)
@@ -192,11 +181,15 @@ async def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
         costi_res = supabase.table("costi_anno_mese").select("*").eq("id_sede", id_sede).eq("anno", anno).execute()
         costi_data = costi_res.data or []
 
-        # 2. Recupera TUTTE le Vendite dell'anno con un JOIN pazzesco per prendere il costo e il prezzo di quel prodotto
-        vendite_res = supabase.table("vendite").select(
-            "*, ricette(costo_ricetta_reale, prezzo_vendita_netto), articoli(prezzo_vendita_netto, prezzo_acquisto_netto)"
-        ).eq("id_sede", id_sede).gte("data_vendita", f"{anno}-01-01").lt("data_vendita", f"{anno+1}-01-01").execute()
-        vendite_data = vendite_res.data or []
+        # 2. Recupera l'andamento mensile delle vendite dell'anno già aggregato lato DB
+        # (vedi sql/001_stat_andamento_vendite.sql) invece di scaricare tutte le vendite dell'anno
+        andamento_res = supabase.rpc("stat_andamento_vendite", {
+            "p_id_sede": id_sede,
+            "p_data_inizio": f"{anno}-01-01",
+            "p_data_fine_esclusiva": f"{anno + 1}-01-01",
+            "p_group_by": "month"
+        }).execute()
+        andamento_vendite = andamento_res.data or []
 
         # 3. Prepariamo il contenitore vuoto per i 12 mesi
         report = {}
@@ -215,30 +208,12 @@ async def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
             if am in report:
                 report[am]["CostiGenerali"] += costo.get("importo", 0)
 
-        # 5. Aggreghiamo le Vendite calcolando Ricavo e Food Cost reali
-        for v in vendite_data:
-            data_v_raw = v.get("data_vendita")
-            if not data_v_raw: continue
-            
-            data_v = data_v_raw[:10]
-            am = data_v[:7] # Estrae "YYYY-MM" da "YYYY-MM-DD"
-            qta = v.get("quantita", 0)
-            
-            ricavo_unitario = 0
-            costo_unitario = 0
-
-            # Se è un prodotto del Menu (pizza, panino, ecc.)
-            if v.get("ricette"):
-                ricavo_unitario = v["ricette"].get("prezzo_vendita_netto", 0)
-                costo_unitario = v["ricette"].get("costo_ricetta_reale", 0)
-            # Se è un prodotto commerciale (coca cola, patatine, ecc.)
-            elif v.get("articoli"):
-                ricavo_unitario = v["articoli"].get("prezzo_vendita_netto", 0)
-                costo_unitario = v["articoli"].get("prezzo_acquisto_netto", 0)
-
+        # 5. Applichiamo l'andamento mensile già aggregato dalla funzione SQL
+        for row in andamento_vendite:
+            am = row["periodo"]  # "YYYY-MM"
             if am in report:
-                report[am]["Ricavi"] += (ricavo_unitario * qta)
-                report[am]["FoodCost"] += (costo_unitario * qta)
+                report[am]["Ricavi"] += row.get("ricavi") or 0.0
+                report[am]["FoodCost"] += row.get("food_cost") or 0.0
 
         # 6. Calcolo Matematico Finale (Margini e Utile)
         risultato_finale = []

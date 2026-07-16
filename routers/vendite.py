@@ -164,9 +164,21 @@ async def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get
 @router.get("/summary")
 async def get_vendite_summary(auth_data = Depends(get_user_sede)):
     """Restituisce il riepilogo delle vendite raggruppato per mese (YYYY-MM)."""
-    res = supabase.table("vendite").select("data_vendita, quantita").eq("id_sede", auth_data["id_sede"]).execute()
-    data = res.data
-    
+    id_sede = auth_data["id_sede"]
+
+    # Paginazione per superare il limite di righe di Supabase (stesso pattern di GET "/")
+    data = []
+    page = 0
+    page_size = 1000
+    while True:
+        res = supabase.table("vendite").select("data_vendita, quantita").eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
+        if not res.data:
+            break
+        data.extend(res.data)
+        if len(res.data) < page_size:
+            break
+        page += 1
+
     summary = {}
     for item in data:
         # data_vendita è ISO 8601 (es: 2026-06-15)
@@ -187,8 +199,22 @@ import calendar
 
 @router.get("/sospese")
 async def get_vendite_sospese(auth_data = Depends(get_user_sede)):
-    res = supabase.table("vendite_sospese").select("*").eq("id_sede", auth_data["id_sede"]).order("created_at", desc=True).execute()
-    return res.data
+    id_sede = auth_data["id_sede"]
+
+    # Paginazione per superare il limite di righe di Supabase (stesso pattern di GET "/")
+    data = []
+    page = 0
+    page_size = 1000
+    while True:
+        res = supabase.table("vendite_sospese").select("*").eq("id_sede", id_sede).order("created_at", desc=True).range(page * page_size, (page + 1) * page_size - 1).execute()
+        if not res.data:
+            break
+        data.extend(res.data)
+        if len(res.data) < page_size:
+            break
+        page += 1
+
+    return data
 
 @router.delete("/sospese/{id}")
 async def delete_vendita_sospesa(id: str, auth_data = Depends(get_user_sede)):
@@ -275,15 +301,30 @@ async def export_vendite(
     auth_data = Depends(get_user_sede)
 ):
     try:
-        # Recupera le vendite nel range temporale unendo i nomi dei prodotti e i prezzi
-        res = supabase.table("vendite").select(
-            "data_vendita, quantita, ricette(nome_ricetta, prezzo_vendita_netto), articoli(nome_articolo, prezzo_vendita_netto)"
-        ).eq("id_sede", auth_data["id_sede"])\
-         .gte("data_vendita", start_date)\
-         .lte("data_vendita", end_date)\
-         .order("data_vendita", desc=False).execute()
+        # Recupera le vendite nel range temporale unendo i nomi dei prodotti e i prezzi.
+        # Paginazione per superare il limite di righe di Supabase (stesso pattern di GET "/"):
+        # senza, un export su un range ampio potrebbe troncare silenziosamente il file Excel.
+        # Il tiebreaker su "id" garantisce un ordinamento stabile tra una pagina e l'altra
+        # anche quando più vendite condividono la stessa data_vendita.
+        data = []
+        page = 0
+        page_size = 1000
+        while True:
+            res = supabase.table("vendite").select(
+                "data_vendita, quantita, ricette(nome_ricetta, prezzo_vendita_netto), articoli(nome_articolo, prezzo_vendita_netto)"
+            ).eq("id_sede", auth_data["id_sede"])\
+             .gte("data_vendita", start_date)\
+             .lte("data_vendita", end_date)\
+             .order("data_vendita", desc=False)\
+             .order("id", desc=False)\
+             .range(page * page_size, (page + 1) * page_size - 1).execute()
+            if not res.data:
+                break
+            data.extend(res.data)
+            if len(res.data) < page_size:
+                break
+            page += 1
 
-        data = res.data
         if not data:
             raise HTTPException(status_code=404, detail="Nessuna vendita trovata nel periodo selezionato.")
 

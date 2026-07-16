@@ -80,8 +80,23 @@ async def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)
 @router.get("/ricette")
 async def get_ricette(auth_data = Depends(get_user_sede)):
     # Restituiamo le ricette e includiamo in automatico i loro ingredienti nidificati e categorie!
-    res = supabase.table("ricette").select("*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, articoli(nome_articolo, unita_misura, prezzo_acquisto_netto))").eq("id_sede", auth_data["id_sede"]).execute()
-    return res.data
+    # Paginazione interna per recuperare SEMPRE tutte le righe, anche oltre il cap di righe di
+    # PostgREST/Supabase su una singola query (~1000), stesso pattern usato in routers/vendite.py.
+    id_sede = auth_data["id_sede"]
+    select_query = "*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, articoli(nome_articolo, unita_misura, prezzo_acquisto_netto))"
+
+    tutte_le_ricette = []
+    offset = 0
+    page_size = 500  # batch più piccolo: ogni riga include ingredienti nidificati, payload più pesante
+    while True:
+        batch = supabase.table("ricette").select(select_query).eq("id_sede", id_sede).range(offset, offset + page_size - 1).execute()
+        rows = batch.data or []
+        tutte_le_ricette.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    return tutte_le_ricette
 
 @router.put("/ricette/{id}")
 async def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_sede)):

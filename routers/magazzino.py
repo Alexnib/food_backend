@@ -83,9 +83,68 @@ async def create_articolo(data: ArticoloCreate, auth_data = Depends(get_user_sed
     return res.data[0]
 
 @router.get("/articoli")
-async def get_articoli(auth_data = Depends(get_user_sede)):
-    res = supabase.table("articoli").select("*, categoria_prodotti(nome_categoria)").eq("id_sede", auth_data["id_sede"]).execute()
-    return res.data
+async def get_articoli(
+    page: int = None,
+    limit: int = 50,
+    search: str = None,
+    tipo: str = None,  # "materia_prima" | "rivendita"
+    unit: str = None,  # es. "kg", "lt", "pz"...
+    sort: str = "nome",  # "nome" | "costo"
+    order: str = "asc",  # "asc" | "desc"
+    auth_data = Depends(get_user_sede)
+):
+    id_sede = auth_data["id_sede"]
+    select_query = "*, categoria_prodotti(nome_categoria)"
+
+    if page is None:
+        # Modalità "catalogo completo" (usata dai picker di vendite/ricette che necessitano
+        # dell'intero catalogo per l'autocompletamento). Paginazione interna per garantire il
+        # recupero di TUTTE le righe oltre il cap di PostgREST/Supabase su singola query
+        # (~1000 righe) — stesso pattern usato in routers/vendite.py.
+        tutti_gli_articoli = []
+        offset = 0
+        page_size = 1000
+        while True:
+            batch = supabase.table("articoli").select(select_query).eq("id_sede", id_sede).range(offset, offset + page_size - 1).execute()
+            rows = batch.data or []
+            tutti_gli_articoli.extend(rows)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        return tutti_gli_articoli
+
+    # Modalità paginata (usata dalla vista elenco Acquisti con scroll infinito):
+    # filtro/ordinamento fatti dal DB, così il payload resta piccolo indipendentemente
+    # da quanti articoli ci sono a catalogo.
+    query = supabase.table("articoli").select(select_query).eq("id_sede", id_sede)
+
+    if search:
+        termine = search.replace(",", " ").replace("%", "").strip()
+        if termine:
+            query = query.or_(f"nome_articolo.ilike.%{termine}%,fornitore.ilike.%{termine}%")
+    if tipo == "materia_prima":
+        query = query.eq("is_materia_prima", True)
+    elif tipo == "rivendita":
+        query = query.eq("is_rivendita", True)
+    if unit:
+        query = query.ilike("unita_misura", unit)
+
+    sort_column = "prezzo_acquisto_netto" if sort == "costo" else "nome_articolo"
+    query = query.order(sort_column, desc=(order == "desc"))
+
+    start = (page - 1) * limit
+    # Chiediamo una riga in più per sapere se esiste una pagina successiva, evitando una
+    # COUNT(*) separata (più economico su cataloghi grandi).
+    res = query.range(start, start + limit).execute()
+    rows = res.data or []
+    has_more = len(rows) > limit
+
+    return {
+        "items": rows[:limit],
+        "page": page,
+        "limit": limit,
+        "has_more": has_more
+    }
 
 @router.put("/articoli/{id}")
 async def update_articolo(id: str, data: ArticoloUpdate, auth_data = Depends(get_user_sede)):
