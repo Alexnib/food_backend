@@ -7,15 +7,87 @@ router = APIRouter(prefix="/api/produzione", tags=["Produzione e Ricette"])
 supabase = Database.get_client()
 
 
+def _costo_ingrediente(quantita_per_kg: float, perc_scarto: float, costo_unitario: float) -> float:
+    """Costo di un ingrediente in ricetta, considerando lo scarto (Es. 20% scarto -> Resa 80% -> 0.8)."""
+    resa = 1 - (perc_scarto / 100)
+    quantita_effettiva = (quantita_per_kg / resa) if resa > 0 else quantita_per_kg
+    return quantita_effettiva * costo_unitario
+
+
+def _calcola_ingredienti_e_costo(id_sede: str, id_ricetta, ingredienti: list) -> tuple[list, float]:
+    """
+    Calcola il costo di ogni ingrediente e prepara le righe da inserire in
+    ingredienti_ricetta. Un'UNICA query batch (.in_()) recupera i prezzi di
+    TUTTE le materie prime coinvolte, invece di una query separata per ogni
+    ingrediente: una ricetta da 15-20 ingredienti passava da 15-20 round-trip
+    di rete sequenziali a 1 solo. Condivisa da create_ricetta e update_ricetta,
+    che facevano lo stesso identico calcolo duplicato.
+    """
+    if not ingredienti:
+        return [], 0.0
+
+    ids_materie_prime = list({ing.id_materia_prima for ing in ingredienti})
+    prezzi_res = supabase.table("articoli").select("id, prezzo_acquisto_netto")\
+        .eq("id_sede", id_sede).in_("id", ids_materie_prime).execute()
+    prezzi_map = {a["id"]: a.get("prezzo_acquisto_netto", 0) or 0 for a in (prezzi_res.data or [])}
+
+    costo_totale_ricetta = 0.0
+    ingredienti_da_inserire = []
+
+    for ing in ingredienti:
+        if ing.id_materia_prima not in prezzi_map:
+            continue  # materia prima non trovata (o di un'altra sede): la saltiamo
+
+        costo_totale_ricetta += _costo_ingrediente(ing.quantita_per_kg, ing.perc_scarto, prezzi_map[ing.id_materia_prima])
+
+        # Prepariamo la riga per il database
+        ingredienti_da_inserire.append({
+            "id_ricetta": id_ricetta,
+            "id_materia_prima": ing.id_materia_prima,
+            "quantita_per_kg": ing.quantita_per_kg,
+            "perc_scarto": ing.perc_scarto
+        })
+
+    return ingredienti_da_inserire, costo_totale_ricetta
+
+
+def ricalcola_costo_ricette(id_ricetta_list: list) -> None:
+    """
+    Ricalcola e salva costo_ricetta_reale per le ricette indicate, usando i
+    prezzi ATTUALI delle materie prime collegate.
+
+    costo_ricetta_reale viene scritto solo qui e in create/update_ricetta: senza
+    questa funzione, cambiare il prezzo di acquisto di una materia prima (in
+    routers/magazzino.py) non si riflette mai sul food cost delle ricette che la
+    usano, finché qualcuno non ri-salva manualmente ciascuna ricetta.
+    """
+    if not id_ricetta_list:
+        return
+
+    ricette_res = supabase.table("ricette").select(
+        "id, ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(prezzo_acquisto_netto))"
+    ).in_("id", id_ricetta_list).execute()
+
+    for ricetta in (ricette_res.data or []):
+        costo_totale = 0.0
+        for ing in (ricetta.get("ingredienti_ricetta") or []):
+            costo_unitario = (ing.get("articoli") or {}).get("prezzo_acquisto_netto", 0) or 0
+            costo_totale += _costo_ingrediente(ing.get("quantita_per_kg", 0) or 0, ing.get("perc_scarto", 0) or 0, costo_unitario)
+
+        supabase.table("ricette").update({"costo_ricetta_reale": round(costo_totale, 2)}).eq("id", ricetta["id"]).execute()
+
+
 @router.post("/ricette", status_code=status.HTTP_201_CREATED)
 def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
     try:
+        id_sede = auth_data["id_sede"]
+
         # 1. Creiamo il "contenitore" della ricetta (costo temporaneo 0)
         ricetta_insert = {
             "nome_ricetta": data.nome_ricetta,
             "descrizione_ricetta": data.descrizione_ricetta,
             "id_categoria_prodotto": data.id_categoria_prodotto,
-            "id_sede": auth_data["id_sede"],
+            "id_sede": id_sede,
             "costo_ricetta_reale": 0.0,
             "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
             "prezzo_vendita_netto": data.prezzo_vendita_netto,
@@ -24,39 +96,14 @@ def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
         res_ricetta = supabase.table("ricette").insert(ricetta_insert).execute()
         id_ricetta_creata = res_ricetta.data[0]["id"]
 
-        costo_totale_ricetta = 0.0
-        ingredienti_da_inserire = []
+        # 2. Calcoliamo il costo di ogni ingrediente e li prepariamo per l'inserimento
+        ingredienti_da_inserire, costo_totale_ricetta = _calcola_ingredienti_e_costo(
+            id_sede, id_ricetta_creata, data.ingredienti
+        )
 
-        # 2. Calcoliamo il costo di ogni ingrediente e prepariamoli per l'inserimento
-        if data.ingredienti:
-            for ing in data.ingredienti:
-                # Peschiamo il costo unitario della materia prima dal DB
-                mp_res = supabase.table("articoli").select("prezzo_acquisto_netto").eq("id", ing.id_materia_prima).execute()
-                
-                if not mp_res.data:
-                    continue # Se non trova la materia prima, la salta
-                
-                costo_unitario = mp_res.data[0]["prezzo_acquisto_netto"]
-                
-                # LA MATEMATICA DELLO SCARTO (Es. 20% scarto -> Resa 80% -> 0.8)
-                resa = 1 - (ing.perc_scarto / 100)
-                quantita_effettiva = (ing.quantita_per_kg / resa) if resa > 0 else ing.quantita_per_kg
-                
-                # Calcolo del costo di questo singolo ingrediente nella ricetta
-                costo_ingrediente = quantita_effettiva * costo_unitario
-                costo_totale_ricetta += costo_ingrediente
-
-                # Prepariamo la riga per il database
-                ingredienti_da_inserire.append({
-                    "id_ricetta": id_ricetta_creata,
-                    "id_materia_prima": ing.id_materia_prima,
-                    "quantita_per_kg": ing.quantita_per_kg,
-                    "perc_scarto": ing.perc_scarto
-                })
-            
-            # Inseriamo tutti gli ingredienti nel DB in un colpo solo (Bulk Insert)
-            if ingredienti_da_inserire:
-                supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
+        # Inseriamo tutti gli ingredienti nel DB in un colpo solo (Bulk Insert)
+        if ingredienti_da_inserire:
+            supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
 
         # 3. Aggiorniamo la ricetta con il VERO Food Cost e i Margini calcolati
         costo_finale = round(costo_totale_ricetta, 2)
@@ -101,36 +148,21 @@ def get_ricette(auth_data = Depends(get_user_sede)):
 @router.put("/ricette/{id}")
 def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_sede)):
     try:
+        id_sede = auth_data["id_sede"]
+
         # 1. Elimina vecchi ingredienti
         supabase.table("ingredienti_ricetta").delete().eq("id_ricetta", id).execute()
-        
+
         # 2. Ricalcola e reinserisci ingredienti
-        costo_totale_ricetta = 0.0
-        ingredienti_da_inserire = []
+        ingredienti_da_inserire, costo_totale_ricetta = _calcola_ingredienti_e_costo(
+            id_sede, id, data.ingredienti
+        )
 
-        if data.ingredienti:
-            for ing in data.ingredienti:
-                mp_res = supabase.table("articoli").select("prezzo_acquisto_netto").eq("id", ing.id_materia_prima).execute()
-                if not mp_res.data: continue
-                costo_unitario = mp_res.data[0]["prezzo_acquisto_netto"]
-                
-                resa = 1 - (ing.perc_scarto / 100)
-                quantita_effettiva = (ing.quantita_per_kg / resa) if resa > 0 else ing.quantita_per_kg
-                costo_ingrediente = quantita_effettiva * costo_unitario
-                costo_totale_ricetta += costo_ingrediente
-
-                ingredienti_da_inserire.append({
-                    "id_ricetta": id,
-                    "id_materia_prima": ing.id_materia_prima,
-                    "quantita_per_kg": ing.quantita_per_kg,
-                    "perc_scarto": ing.perc_scarto
-                })
-            
-            if ingredienti_da_inserire:
-                supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
+        if ingredienti_da_inserire:
+            supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
 
         costo_finale = round(costo_totale_ricetta, 2)
-        
+
         # 3. Aggiorna dati ricetta
         update_data = {
             "nome_ricetta": data.nome_ricetta,
@@ -141,8 +173,8 @@ def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_se
             "prezzo_vendita_netto": data.prezzo_vendita_netto,
             "id_iva_vendita": data.id_iva_vendita
         }
-        res = supabase.table("ricette").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
-        
+        res = supabase.table("ricette").update(update_data).eq("id", id).eq("id_sede", id_sede).execute()
+
         return {"message": "Ricetta aggiornata", "id": id, "costo_ricetta_reale": costo_finale}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
 from models.magazzino import *
 from utils.auth_utils import get_user_sede
+from routers.produzione import ricalcola_costo_ricette
 
 router = APIRouter(prefix="/api/magazzino", tags=["Magazzino"])
 supabase = Database.get_client()
@@ -149,7 +150,7 @@ def get_articoli(
 @router.put("/articoli/{id}")
 def update_articolo(id: str, data: ArticoloUpdate, auth_data = Depends(get_user_sede)):
     update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
-    
+
     # Ricalcola i margini se cambiano
     old_data = supabase.table("articoli").select("prezzo_vendita_netto, prezzo_acquisto_netto, is_rivendita").eq("id", id).execute()
     if old_data.data:
@@ -162,6 +163,16 @@ def update_articolo(id: str, data: ArticoloUpdate, auth_data = Depends(get_user_
             update_data["margine_perc"] = margine_perc
 
     res = supabase.table("articoli").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+
+    # Se il prezzo di acquisto è cambiato, il food cost delle ricette che usano
+    # questo articolo come ingrediente è diventato obsoleto: lo ricalcoliamo.
+    nuovo_prezzo = update_data.get("prezzo_acquisto_netto")
+    vecchio_prezzo = old_data.data[0].get("prezzo_acquisto_netto") if old_data.data else None
+    if nuovo_prezzo is not None and nuovo_prezzo != vecchio_prezzo:
+        affected = supabase.table("ingredienti_ricetta").select("id_ricetta").eq("id_materia_prima", id).execute()
+        id_ricette_da_aggiornare = list({r["id_ricetta"] for r in (affected.data or [])})
+        ricalcola_costo_ricette(id_ricette_da_aggiornare)
+
     return res.data[0] if res.data else None
 
 @router.delete("/articoli/{id}")

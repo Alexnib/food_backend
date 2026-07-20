@@ -9,6 +9,7 @@ from routers.produzione import router as produzione
 from routers.vendite import router as vendite
 from routers.statistiche import router as statistiche
 from routers.ai_scanner import router as ai_scanner
+from routers.admin import router as admin
 from routers import import_magazzino
 
 app = FastAPI(title="Gestionale Food API")
@@ -32,6 +33,7 @@ app.include_router(produzione)
 app.include_router(vendite)
 app.include_router(statistiche)
 app.include_router(ai_scanner)
+app.include_router(admin)
 app.include_router(import_magazzino.router)
 
 # Endpoint di base per verificare che il server sia acceso

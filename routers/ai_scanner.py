@@ -31,31 +31,43 @@ REGOLE UNIVERSALI DI ESTRAZIONE:
 1. IDENTIFICAZIONE PRODOTTI E COPERTO:
    - Estrai ogni singola voce ordinata dal cliente (piatti, bevande, dolci).
    - FAI ESTREMA ATTENZIONE AL "COPERTO": è una voce fondamentale in Italia, se lo vedi nello scontrino o nella comanda DEVI estrarlo sempre.
-   - Ignora tutto ciò che non è un prodotto: subtotali, sconti, IVA, calcolo del resto, pagamenti elettronici, indirizzi o numeri di tavolo.
+   - Ignora tutto ciò che non è un prodotto (non estrarlo come voce a sé): subtotali, sconti, calcolo del resto, pagamenti elettronici, indirizzi o numeri di tavolo. Le righe di riepilogo IVA fanno eccezione solo nel senso che vanno lette per ricavarne l'aliquota (vedi punto 3) ma non vanno mai estratte come un prodotto.
 
 2. GESTIONE QUANTITÀ E LAYOUT DEGLI SCONTRINI (REGOLA FERREA):
-   - I registratori di cassa stampano il moltiplicatore sempre sulla riga PRECEDENTE (SOPRA) al nome del prodotto.
-   - REGOLA VISIVA INFALLIBILE: Se leggi una riga con il formato "Numero x Prezzo" (es. "3 x 25,00", "5 x 2,00"), quel "Numero" è la quantità del prodotto stampato ESATTAMENTE NELLA RIGA SOTTOSTANTE.
+   - I registratori di cassa stampano il moltiplicatore il più delle volte sulla riga PRECEDENTE (SOPRA) al nome del prodotto, ma su alcuni modelli di cassa/gestionale il moltiplicatore è stampato SOTTO, sulla riga SUCCESSIVA al prodotto. Non dare per scontata la posizione: individuala caso per caso osservando il layout reale del documento.
+   - REGOLA VISIVA: Se leggi una riga con il formato "Numero x Prezzo" (es. "3 x 25,00", "5 x 2,00"), quel "Numero" è la quantità del prodotto a cui la riga è associata (sopra o sotto), e quel "Prezzo" è il prezzo unitario del prodotto (prezzo_singolo).
    - ESEMPI REALI CHE DEVI SEGUIRE ALLA LETTERA:
-     CASO A:
+     CASO A (moltiplicatore sopra):
      [Riga 1] 3 x 25,00
      [Riga 2] DONNA GIULIANA ROSATO     75,00
-     -> Estrazione Corretta: Prodotto = "DONNA GIULIANA ROSATO", Quantita = 3. (Perché 3 x 25 fa 75).
-     
-     CASO B:
+     -> Estrazione Corretta: Prodotto = "DONNA GIULIANA ROSATO", Quantita = 3, prezzo_singolo = 25.00, prezzo_totale = 75.00. (Perché 3 x 25 fa 75).
+
+     CASO B (moltiplicatore sopra, coperto):
      [Riga 1] 5 x 2,00
      [Riga 2] Coperto                   10,00
-     -> Estrazione Corretta: Prodotto = "Coperto", Quantita = 5. (Perché 5 x 2 fa 10).
+     -> Estrazione Corretta: Prodotto = "Coperto", Quantita = 5, prezzo_singolo = 2.00, prezzo_totale = 10.00. (Perché 5 x 2 fa 10).
 
-   - DIVIETO ASSOLUTO: Non assegnare MAI il moltiplicatore al prodotto che si trova sulla riga precedente. Il flusso di lettura corretto è sempre: [Riga sopra = Moltiplicatore] -> [Riga sotto = Prodotto a cui si applica].
-   - Se NON c'è una riga con un moltiplicatore sopra il prodotto, la quantità è SEMPRE 1 (es. "2P - CALABRIA DOCET" non ha moltiplicatori sopra, quindi la quantità è 1).
-   - Anche il coperto potrebbe avere dei moltiplicatori (es. "3 x Coperto" o "3 x 2,00" ), applica le stesse regole. PRESTA ATTENZIONE AI MOLTIPLICATORI CHE SI RIFERISCONO AL COPERTO, SONO MOLTO FREQUENTI.
+     CASO C (moltiplicatore sotto):
+     [Riga 1] ACQUA NATURALE 1L         6,00
+     [Riga 2] 2 x 3,00
+     -> Estrazione Corretta: Prodotto = "ACQUA NATURALE 1L", Quantita = 2, prezzo_singolo = 3.00, prezzo_totale = 6.00. (Perché 2 x 3 fa 6, e 6,00 coincide con l'importo già stampato sulla riga del prodotto).
 
-3. GESTIONE DELLA DATA:
+   - PROVA DEL NOVE (VERIFICA OBBLIGATORIA): prima di finalizzare ogni riga, controlla sempre che quantita × prezzo_singolo = prezzo_totale (tollera differenze di pochi centesimi dovute ad arrotondamenti). Usa questo controllo per decidere se il moltiplicatore letto si riferisce al prodotto sopra o sotto, e per accorgerti di eventuali errori di lettura: se il conto non torna con l'ipotesi fatta, riconsidera quale riga è la quantità e quale il prodotto finché i numeri non tornano.
+   - Se NON c'è alcuna riga con un moltiplicatore associata al prodotto (né sopra né sotto), la quantità è SEMPRE 1 (es. "2P - CALABRIA DOCET" senza moltiplicatori, quantità = 1). In questo caso l'unico numero stampato sulla riga del prodotto è sia prezzo_singolo che prezzo_totale (sono uguali, dato che quantita=1).
+   - Anche il coperto potrebbe avere dei moltiplicatori (sopra o sotto, es. "3 x Coperto" o "3 x 2,00"), applica le stesse regole. PRESTA ATTENZIONE AI MOLTIPLICATORI CHE SI RIFERISCONO AL COPERTO, SONO MOLTO FREQUENTI.
+
+3. GESTIONE DEL PREZZO E DELL'IVA:
+   - 'prezzo_singolo': il prezzo di UNA unità del prodotto (quello nel moltiplicatore "Numero x Prezzo", o il prezzo stampato sulla riga stessa se non c'è moltiplicatore).
+   - 'prezzo_totale': l'importo complessivo stampato su quella riga (quantità × prezzo unitario).
+   - Se lo scontrino/comanda NON riporta alcun prezzo per una voce (capita in comande interne senza prezzi), lascia ENTRAMBI i campi a null: NON inventare né stimare un prezzo.
+   - IMPORTANTE: i prezzi stampati su scontrini fiscali, pre-conti e comande sono SEMPRE prezzi LORDI (IVA già inclusa, è l'importo che il cliente paga). Estraili così come sono scritti: NON provare tu a scorporare l'IVA o a calcolare un prezzo netto, ci pensa il sistema a valle una volta note quantità e aliquota.
+   - 'iva_percentuale': se il documento riporta esplicitamente un'aliquota IVA applicata (es. una dicitura "IVA 10%", "Aliquota 10,00%", oppure una tabella di riepilogo IVA a fondo scontrino con una o più aliquote per reparto), estrai quella percentuale come numero (es. 10, 22, 4). Se sul documento compare UNA SOLA aliquota valida per tutto lo scontrino, applicala a ogni riga. Se invece compaiono PIÙ aliquote diverse per reparti/categorie differenti e non riesci a determinare con certezza quale si applica a una specifica riga, lascia 'iva_percentuale' null per quella riga (il sistema userà comunque l'aliquota del prodotto già presente a listino). Se il documento non riporta alcuna indicazione di IVA, lascia sempre 'iva_percentuale' null.
+
+4. GESTIONE DELLA DATA:
    - Cerca la data stampata sul documento (formato "YYYY-MM-DD").
    - SE NON TROVI LA DATA (molto comune nelle comande interne o pre-conti tagliati), NON INVENTARLA MAI. Inserisci semplicemente il valore null nel JSON. Sarà l'utente del gestionale a inserirla manualmente in seguito.
 
-4. MATCHING CON IL MENU E ASSOCIAZIONE MANUALE:
+5. MATCHING CON IL MENU E ASSOCIAZIONE MANUALE:
    - Confronta il nome del prodotto che hai letto con il menù del ristorante fornito qui sotto. 
    - Se trovi il prodotto nel menù, inserisci il suo "id".
    - SE NON RIESCI AD ASSOCIARLO con certezza (perché il nome è scritto male o non è in lista), inserisci null nel campo "id_prodotto_menu". L'IA non deve scartare il prodotto: ESTRAILO COMUNQUE, inserendo null nell'ID permetterai all'utente di fare l'associazione manuale.
@@ -71,7 +83,10 @@ OUTPUT RICHIESTO (Restituisci ESCLUSIVAMENTE l'array JSON piatto, senza testo pr
     "data_vendita": "YYYY-MM-DD" oppure null,
     "nome_rilevato": "Nome del prodotto estratto",
     "id_prodotto_menu": "id-del-prodotto" oppure null,
-    "quantita": numero intero
+    "quantita": numero intero,
+    "prezzo_singolo": numero (prezzo unitario, LORDO come stampato) oppure null,
+    "prezzo_totale": numero (importo di riga, LORDO come stampato) oppure null,
+    "iva_percentuale": numero (aliquota IVA se indicata sullo scontrino) oppure null
   }}
 ]
 """
@@ -89,8 +104,8 @@ async def scan_receipts(
     NON salva nulla nel DB.
     """
     # 1. Recupera l'intero menù della sede
-    finiti_res = supabase.table("prodtti_finiti").select(
-        "id, ricette(nome_ricetta)"
+    finiti_res = supabase.table("ricette").select(
+        "id, nome_ricetta"
     ).eq("id_sede", auth_data["id_sede"]).execute()
 
     commerciali_res = supabase.table("articoli").select(
@@ -100,8 +115,7 @@ async def scan_receipts(
     menu = []
     menu_lookup = {}
     for p in (finiti_res.data or []):
-        nome = p.get("ricette", {}).get("nome_ricetta", "N/D") if p.get("ricette") else "N/D"
-        item = {"id": str(p["id"]), "nome": nome, "tipo": "finito"}
+        item = {"id": str(p["id"]), "nome": p.get("nome_ricetta", "N/D"), "tipo": "finito"}
         menu.append(item)
         menu_lookup[str(p["id"])] = item
 

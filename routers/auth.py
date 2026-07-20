@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, status, Request, Depends
-from utils.auth_utils import get_current_user
+from fastapi.security import HTTPAuthorizationCredentials
+from utils.auth_utils import get_current_user, security
 from models.auth import UserRegister, UserLogin, RefreshTokenRequest, ForgotPassword, UpdatePassword, UpdateUser
 from fastapi.responses import RedirectResponse
 from supabase import create_client
@@ -33,7 +34,7 @@ def register(user: UserRegister):
                 "data": {
                     "nome": user.nome,
                     "cognome": user.cognome,
-                    "role": user.role,
+                    "role": 2,  # sempre "user" (id 2 in roles): mai scelto dal chiamante
                     "telefono": user.cellulare,
                     "id_sede": str(user.id_sede) if user.id_sede else None
                 }
@@ -121,6 +122,22 @@ def refresh_token(data: RefreshTokenRequest):
             detail="Sessione scaduta in modo permanente. Effettua nuovamente il login."
         )
         
+@router.post("/logout")
+def logout(current_user = Depends(get_current_user), credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    Revoca la sessione lato Supabase (tutti i refresh token dell'utente, scope
+    "global"): senza questo, il logout era puramente client-side e un refresh
+    token rimasto salvato altrove avrebbe continuato a funzionare.
+    """
+    try:
+        admin_client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+        admin_client.auth.admin.sign_out(credentials.credentials, "global")
+    except Exception as e:
+        # Il logout locale deve comunque riuscire: la revoca è un "best effort".
+        logging.warning(f"Impossibile revocare la sessione Supabase per {current_user.id}: {e}")
+
+    return {"message": "Logout effettuato"}
+
 @router.get("/google/login")
 def google_login():
     """

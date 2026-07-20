@@ -153,7 +153,10 @@ Il tuo compito è estrarre l'elenco delle vendite e restituirlo come un JSON che
     {{
       "nome_prodotto_estratto": "Nome del prodotto venduto",
       "quantita": 10.5,
-      "data_vendita": "YYYY-MM-DD"
+      "data_vendita": "YYYY-MM-DD",
+      "prezzo_singolo": 4.5,
+      "prezzo_totale": 47.25,
+      "prezzo_lordo": false
     }}
   ]
 }}
@@ -163,6 +166,8 @@ Regole:
 2. 'quantita': Numero intero o decimale rappresentante la quantità venduta.
 3. 'data_vendita': Trasforma qualsiasi formato di data presente nel file nel formato ISO "YYYY-MM-DD" (es: 2026-07-13). Se non è presente una data in una riga, cerca di dedurla dalle righe precedenti.
 4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA del file CSV fornitoti. Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide nel CSV.
+5. 'prezzo_singolo' e 'prezzo_totale' (OPZIONALI): SOLO se il file contiene colonne di prezzo per quella riga. 'prezzo_singolo' è il prezzo di UNA unità del prodotto; 'prezzo_totale' è il ricavo complessivo della riga (prezzo_singolo * quantita, o un importo già totale presente nel file). Estrai quello/i che trovi così come sono scritti, senza inventarli né calcolarli tu se manca l'informazione: se il file NON ha nessuna colonna riconducibile a un prezzo/importo/ricavo, lascia ENTRAMBI i campi a null. Se trovi solo uno dei due (es. solo il totale di riga, o solo il prezzo unitario), valorizza solo quello e lascia l'altro a null.
+6. 'prezzo_lordo' (SOLO se hai estratto un prezzo, altrimenti null): stabilisci se i prezzi della colonna sono NETTI (prezzo di listino impostato dal ristoratore) o LORDI (IVA inclusa, tipicamente copiati da uno scontrino). Guardali nel loro insieme: i prezzi NETTI di listino sono quasi sempre cifre "pulite" e tonde, come 10, 10.5, 12, 15.5, 3, 8 — impostate a mano dal gestore; i prezzi LORDI risultano invece da un calcolo con l'IVA e hanno più spesso centesimi "strani" e non tondi, come 8.80, 13.31, 4.95, 11.90. Valuta la colonna nel suo complesso: se la maggior parte dei valori sono cifre tonde, imposta 'prezzo_lordo' a false (sono netti) per tutte le righe; se la maggior parte hanno decimali irregolari, imposta 'prezzo_lordo' a true (sono lordi, il sistema li convertirà in netto usando l'aliquota IVA del prodotto). Se sei in dubbio, preferisci false (netto), che è il caso più comune per un listino.
 
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
 """
