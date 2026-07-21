@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
 from models.magazzino import *
 from utils.auth_utils import get_user_sede
+from utils.numbers import round2
 from routers.produzione import ricalcola_costo_ricette
 
 router = APIRouter(prefix="/api/magazzino", tags=["Magazzino"])
@@ -26,6 +27,13 @@ def get_iva():
     res = local_supabase.table("iva").select("*").execute()
     return res.data
 
+@router.get("/destinazioni")
+def get_destinazioni():
+    """Le 2 destinazioni fisse (Food / Beverage) usate per organizzare le
+    categorie prodotto nello schema visuale in Gestione Categorie."""
+    res = supabase.table("destinazione_prodotto").select("*").execute()
+    return res.data
+
 @router.post("/categorie", status_code=status.HTTP_201_CREATED)
 def create_categoria(data: CategoriaProdottoCreate, auth_data = Depends(get_user_sede)):
     insert_data = data.model_dump(mode="json")
@@ -39,17 +47,17 @@ def create_categoria(data: CategoriaProdottoCreate, auth_data = Depends(get_user
 
 @router.get("/categorie")
 def get_categorie(auth_data = Depends(get_user_sede)):
-    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*)").eq("id_sede", auth_data["id_sede"]).execute()
+    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", auth_data["id_sede"]).execute()
     return res.data
 
 @router.get("/categorie/rivendita")
 def get_categorie_rivendita(auth_data = Depends(get_user_sede)):
-    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*)").eq("id_sede", auth_data["id_sede"]).eq("id_macro_categoria", 1).execute()
+    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", auth_data["id_sede"]).eq("id_macro_categoria", 1).execute()
     return res.data
 
 @router.get("/categorie/ricette")
 def get_categorie_ricette(auth_data = Depends(get_user_sede)):
-    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*)").eq("id_sede", auth_data["id_sede"]).eq("id_macro_categoria", 2).execute()
+    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", auth_data["id_sede"]).eq("id_macro_categoria", 2).execute()
     return res.data
 
 @router.put("/categorie/{id}")
@@ -70,7 +78,12 @@ def delete_categoria(id: int, auth_data = Depends(get_user_sede)):
 def create_articolo(data: ArticoloCreate, auth_data = Depends(get_user_sede)):
     insert_data = data.model_dump(mode="json")
     insert_data["id_sede"] = auth_data["id_sede"]
-    
+
+    # Arrotondiamo sempre a 2 decimali i prezzi prima di salvarli: la conversione
+    # netto/lordo IVA lato frontend può produrre numeri periodici (es. 1/1.1).
+    for campo in ("prezzo_acquisto_lordo", "prezzo_acquisto_netto", "prezzo_vendita_lordo", "prezzo_vendita_netto"):
+        insert_data[campo] = round2(insert_data.get(campo))
+
     # Calcolo automatico dei margini usando i prezzi netti, SOLO se è rivendita
     if insert_data.get("is_rivendita"):
         margine, margine_perc = calcola_margini(insert_data["prezzo_vendita_netto"], insert_data["prezzo_acquisto_netto"])
@@ -106,7 +119,7 @@ def get_articoli(
         offset = 0
         page_size = 1000
         while True:
-            batch = supabase.table("articoli").select(select_query).eq("id_sede", id_sede).range(offset, offset + page_size - 1).execute()
+            batch = supabase.table("articoli").select(select_query).eq("id_sede", id_sede).eq("is_cancelled", False).range(offset, offset + page_size - 1).execute()
             rows = batch.data or []
             tutti_gli_articoli.extend(rows)
             if len(rows) < page_size:
@@ -117,7 +130,7 @@ def get_articoli(
     # Modalità paginata (usata dalla vista elenco Acquisti con scroll infinito):
     # filtro/ordinamento fatti dal DB, così il payload resta piccolo indipendentemente
     # da quanti articoli ci sono a catalogo.
-    query = supabase.table("articoli").select(select_query).eq("id_sede", id_sede)
+    query = supabase.table("articoli").select(select_query).eq("id_sede", id_sede).eq("is_cancelled", False)
 
     if search:
         termine = search.replace(",", " ").replace("%", "").strip()
@@ -151,6 +164,12 @@ def get_articoli(
 def update_articolo(id: str, data: ArticoloUpdate, auth_data = Depends(get_user_sede)):
     update_data = {k: v for k, v in data.model_dump(mode="json").items() if v is not None}
 
+    # Arrotondiamo sempre a 2 decimali i prezzi prima di salvarli: la conversione
+    # netto/lordo IVA lato frontend può produrre numeri periodici (es. 1/1.1).
+    for campo in ("prezzo_acquisto_lordo", "prezzo_acquisto_netto", "prezzo_vendita_lordo", "prezzo_vendita_netto"):
+        if campo in update_data:
+            update_data[campo] = round2(update_data[campo])
+
     # Ricalcola i margini se cambiano
     old_data = supabase.table("articoli").select("prezzo_vendita_netto, prezzo_acquisto_netto, is_rivendita").eq("id", id).execute()
     if old_data.data:
@@ -177,5 +196,27 @@ def update_articolo(id: str, data: ArticoloUpdate, auth_data = Depends(get_user_
 
 @router.delete("/articoli/{id}")
 def delete_articolo(id: str, auth_data = Depends(get_user_sede)):
+    """Se l'articolo è usato come ingrediente in almeno una ricetta, l'eliminazione
+    è bloccata del tutto: va prima rimosso dalle ricette che lo usano, altrimenti
+    il food cost di quelle ricette diventerebbe incalcolabile.
+    Se non è usato come ingrediente ma ha vendite dirette registrate, eliminazione
+    "soft" (is_cancelled=true): resta a DB ma sparisce dai picker.
+    Altrimenti (nessun uso, nessuna vendita), eliminazione reale."""
+    ingrediente_res = supabase.table("ingredienti_ricetta").select("id_ricetta").eq("id_materia_prima", id).limit(1).execute()
+    if ingrediente_res.data:
+        raise HTTPException(
+            status_code=400,
+            detail="Impossibile eliminare: questo articolo è usato come ingrediente in una o più ricette. Rimuovilo prima dalle ricette che lo usano."
+        )
+
+    vendite_res = supabase.table("vendite").select("id").eq("id_prodotto_commerciale", id).limit(1).execute()
+    if vendite_res.data:
+        res = supabase.table("articoli").update({"is_cancelled": True}).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Articolo non trovato o non autorizzato.")
+        return {"message": "Articolo eliminato"}
+
     res = supabase.table("articoli").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Articolo non trovato o non autorizzato.")
     return {"message": "Articolo eliminato"}

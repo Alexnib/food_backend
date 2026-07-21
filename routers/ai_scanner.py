@@ -103,14 +103,15 @@ async def scan_receipts(
     che hanno trovato corrispondenza nel menù (filtro di scarto).
     NON salva nulla nel DB.
     """
-    # 1. Recupera l'intero menù della sede
+    # 1. Recupera l'intero menù della sede (esclusi i prodotti eliminati: non ha
+    # senso far associare l'IA a un prodotto non più in vendita).
     finiti_res = supabase.table("ricette").select(
         "id, nome_ricetta"
-    ).eq("id_sede", auth_data["id_sede"]).execute()
+    ).eq("id_sede", auth_data["id_sede"]).eq("is_cancelled", False).execute()
 
     commerciali_res = supabase.table("articoli").select(
         "id, nome_articolo"
-    ).eq("is_rivendita", True).eq("id_sede", auth_data["id_sede"]).execute()
+    ).eq("is_rivendita", True).eq("id_sede", auth_data["id_sede"]).eq("is_cancelled", False).execute()
 
     menu = []
     menu_lookup = {}

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
 from models.vendite import *
 from utils.auth_utils import get_user_sede
+from utils.numbers import round2
 from fastapi.responses import StreamingResponse
 import io
 import pandas as pd
@@ -119,9 +120,9 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
             # Prezzo unitario di questa riga: quello esplicito (scontrino/excel), oppure
             # derivato dal totale di riga se solo quello è stato rilevato. Se nessuno dei
             # due è presente resta None e verrà recuperato dal listino più sotto.
-            prezzo_singolo_item = item.prezzo_singolo
+            prezzo_singolo_item = round2(item.prezzo_singolo)
             if prezzo_singolo_item is None and item.prezzo_totale is not None and item.quantita:
-                prezzo_singolo_item = item.prezzo_totale / item.quantita
+                prezzo_singolo_item = round2(item.prezzo_totale / item.quantita)
 
             # Instradiamo esplicitamente solo i due casi con un prodotto riconosciuto.
             # Qualunque altro valore di id_tipo — "sospeso", None (l'AI non ha trovato
@@ -257,7 +258,7 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                     # per precisione (non arrotondato) o come fallback se fosse null.
                     sale = existing_sales_dict[key]
                     new_quantita = sale["quantita"] + quantita_da_aggiungere
-                    prezzo_singolo = sale.get("prezzo_singolo") if sale.get("prezzo_singolo") is not None else group["prezzo_singolo"]
+                    prezzo_singolo = round2(sale.get("prezzo_singolo") if sale.get("prezzo_singolo") is not None else group["prezzo_singolo"])
                     vendite_to_upsert.append({
                         "id": sale["id"],
                         "data_vendita": data_vendita,
@@ -269,7 +270,7 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                         "prezzo_totale": round(new_quantita * prezzo_singolo, 2) if prezzo_singolo is not None else None,
                     })
                 else:
-                    prezzo_singolo = group["prezzo_singolo"]
+                    prezzo_singolo = round2(group["prezzo_singolo"])
                     vendite_to_upsert.append({
                         "data_vendita": data_vendita,
                         "quantita": quantita_da_aggiungere,
@@ -309,9 +310,9 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
         existing = query.execute()
 
         # Prezzo unitario: quello passato esplicitamente, altrimenti quello attuale di listino.
-        prezzo_singolo = data.prezzo_singolo
+        prezzo_singolo = round2(data.prezzo_singolo)
         if prezzo_singolo is None:
-            prezzo_singolo = _get_listino_price(data.id_ricetta, data.id_prodotto_commerciale)
+            prezzo_singolo = round2(_get_listino_price(data.id_ricetta, data.id_prodotto_commerciale))
 
         if existing.data and len(existing.data) > 0:
             # Aggiorna la quantità
@@ -319,7 +320,7 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
             new_quantita = existing_record["quantita"] + data.quantita
             # Stesso prodotto, stesso giorno = stesso prezzo: se la riga già salvata
             # ce l'ha, prevale su quello appena determinato.
-            prezzo_finale = existing_record.get("prezzo_singolo") if existing_record.get("prezzo_singolo") is not None else prezzo_singolo
+            prezzo_finale = round2(existing_record.get("prezzo_singolo") if existing_record.get("prezzo_singolo") is not None else prezzo_singolo)
             update_payload = {"quantita": new_quantita}
             if prezzo_finale is not None:
                 update_payload["prezzo_singolo"] = prezzo_finale
@@ -332,7 +333,7 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
             insert_data["id_sede"] = auth_data["id_sede"]
             insert_data["prezzo_singolo"] = prezzo_singolo
             if data.prezzo_totale is not None:
-                insert_data["prezzo_totale"] = data.prezzo_totale
+                insert_data["prezzo_totale"] = round2(data.prezzo_totale)
             elif prezzo_singolo is not None:
                 insert_data["prezzo_totale"] = round(data.quantita * prezzo_singolo, 2)
 
@@ -347,6 +348,12 @@ def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get_user_
         update_data = data.model_dump(exclude_unset=True, mode="json")
         if not update_data:
             raise HTTPException(status_code=400, detail="Nessun dato da aggiornare.")
+
+        # Arrotondiamo sempre a 2 decimali i prezzi passati esplicitamente dal client.
+        if "prezzo_singolo" in update_data:
+            update_data["prezzo_singolo"] = round2(update_data["prezzo_singolo"])
+        if "prezzo_totale" in update_data:
+            update_data["prezzo_totale"] = round2(update_data["prezzo_totale"])
 
         # Se cambia la quantità ma non viene passato un nuovo prezzo totale,
         # lo ricalcoliamo dal prezzo unitario già salvato (o da quello nuovo, se passato).
@@ -400,6 +407,65 @@ def get_vendite_summary(auth_data = Depends(get_user_sede)):
 from typing import Optional
 import calendar
 
+@router.get("/per-prodotto")
+def get_vendite_per_prodotto(
+    id_ricetta: Optional[str] = None,
+    id_prodotto_commerciale: Optional[str] = None,
+    auth_data = Depends(get_user_sede)
+):
+    """Tutte le vendite già registrate di UN prodotto specifico, una riga per
+    ogni combinazione data/prezzo distinta — usato dallo strumento di modifica
+    prezzi in blocco: permette di vedere in un colpo solo tutti i giorni in cui
+    quel prodotto è stato venduto, con il prezzo applicato quel giorno, e
+    selezionarne alcuni (o tutti) per aggiornare il prezzo con /bulk-prezzo."""
+    if not id_ricetta and not id_prodotto_commerciale:
+        raise HTTPException(status_code=400, detail="Specifica un prodotto (ricetta o articolo).")
+
+    query = supabase.table("vendite").select("*").eq("id_sede", auth_data["id_sede"])
+    if id_ricetta:
+        query = query.eq("id_ricetta", id_ricetta)
+    else:
+        query = query.eq("id_prodotto_commerciale", id_prodotto_commerciale)
+
+    all_data = []
+    page = 0
+    page_size = 1000
+    while True:
+        res = query.order("data_vendita", desc=True).range(page * page_size, (page + 1) * page_size - 1).execute()
+        if not res.data:
+            break
+        all_data.extend(res.data)
+        if len(res.data) < page_size:
+            break
+        page += 1
+
+    return all_data
+
+@router.put("/bulk-prezzo")
+def aggiorna_prezzo_bulk(data: VenditaBulkPrezzoUpdate, auth_data = Depends(get_user_sede)):
+    """Applica lo stesso nuovo prezzo unitario a un insieme di vendite già
+    registrate (selezionate dall'utente in /per-prodotto), ricalcolando il
+    totale di riga in base alla quantità già salvata su ciascuna."""
+    if not data.ids:
+        return {"message": "Nessuna vendita selezionata."}
+
+    nuovo_prezzo = round2(data.nuovo_prezzo_singolo)
+    if nuovo_prezzo is None or nuovo_prezzo < 0:
+        raise HTTPException(status_code=400, detail="Prezzo non valido.")
+
+    res = supabase.table("vendite").select("id, quantita").in_("id", data.ids).eq("id_sede", auth_data["id_sede"]).execute()
+    righe = res.data or []
+
+    aggiornate = 0
+    for riga in righe:
+        supabase.table("vendite").update({
+            "prezzo_singolo": nuovo_prezzo,
+            "prezzo_totale": round(riga["quantita"] * nuovo_prezzo, 2),
+        }).eq("id", riga["id"]).execute()
+        aggiornate += 1
+
+    return {"message": f"{aggiornate} vendite aggiornate"}
+
 @router.get("/sospese")
 def get_vendite_sospese(auth_data = Depends(get_user_sede)):
     id_sede = auth_data["id_sede"]
@@ -438,10 +504,10 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
 
         # Prezzo: se lo scontrino/excel l'aveva già rilevato sulla sospesa, resta quello;
         # altrimenti, ora che il prodotto è noto, lo recuperiamo dal listino attuale.
-        prezzo_singolo = sospesa.get("prezzo_singolo")
-        prezzo_totale = sospesa.get("prezzo_totale")
+        prezzo_singolo = round2(sospesa.get("prezzo_singolo"))
+        prezzo_totale = round2(sospesa.get("prezzo_totale"))
         if prezzo_singolo is None:
-            prezzo_singolo = _get_listino_price(data.id_ricetta, data.id_prodotto_commerciale)
+            prezzo_singolo = round2(_get_listino_price(data.id_ricetta, data.id_prodotto_commerciale))
         if prezzo_totale is None and prezzo_singolo is not None:
             prezzo_totale = round(sospesa["quantita"] * prezzo_singolo, 2)
 
@@ -493,7 +559,31 @@ def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_sede))
         if len(res.data) < page_size:
             break
         page += 1
-        
+
+    # Prezzo di vendita lordo (IVA inclusa), calcolato al volo dall'aliquota IVA
+    # ATTUALE del prodotto: i prezzi salvati sono sempre netti (vedi conversione
+    # in /bulk), il lordo è solo per la visualizzazione e non viene mai salvato.
+    # Riflette l'aliquota di oggi, non necessariamente quella in vigore al
+    # momento della vendita (non la conserviamo per singola riga).
+    ids_ricette = [r["id_ricetta"] for r in all_data if r.get("id_ricetta")]
+    ids_commerciali = [r["id_prodotto_commerciale"] for r in all_data if r.get("id_prodotto_commerciale")]
+    iva_ricette, iva_articoli = _get_iva_rates_batch(ids_ricette, ids_commerciali)
+
+    for r in all_data:
+        iva_perc = iva_ricette.get(r["id_ricetta"]) if r.get("id_ricetta") else iva_articoli.get(r.get("id_prodotto_commerciale"))
+        if iva_perc is not None and r.get("prezzo_singolo") is not None:
+            # Il totale lordo si deriva SEMPRE dall'unitario lordo già arrotondato
+            # (quantita * unitario), mai da un arrotondamento indipendente sul
+            # totale netto: stessa convenzione già in uso per il netto in tutto
+            # il resto dell'app (vedi /bulk-prezzo), altrimenti le due cifre
+            # possono divergere di un centesimo per via di arrotondamenti
+            # indipendenti (es. 4.55 * 1.10 = 5.00 ma 54.60 * 1.10 / 12 = 5.005).
+            r["prezzo_singolo_lordo"] = round2(r["prezzo_singolo"] * (1 + iva_perc / 100))
+            r["prezzo_totale_lordo"] = round2(r["prezzo_singolo_lordo"] * (r.get("quantita") or 0))
+        else:
+            r["prezzo_singolo_lordo"] = None
+            r["prezzo_totale_lordo"] = None
+
     return all_data
 
 @router.delete("/{id}")

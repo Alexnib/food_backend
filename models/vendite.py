@@ -44,6 +44,14 @@ class VenditaBulkPayload(BaseModel):
 
 class VenditaBulkDelete(BaseModel):
     ids: List[int]
+
+class VenditaBulkPrezzoUpdate(BaseModel):
+    """Modifica in blocco del prezzo di vendita su un insieme di vendite già
+    registrate (stesso prodotto, giorni diversi) — usata dallo strumento di
+    modifica prezzi in Registro Vendite."""
+    ids: List[int]
+    nuovo_prezzo_singolo: float
+
 class ImportedVendita(BaseModel):
     nome_prodotto_estratto: str
     quantita: float

@@ -4,10 +4,14 @@ from typing import Optional, List, Union
 class CategoriaProdottoCreate(BaseModel):
     nome_categoria: str
     id_macro_categoria: Optional[int] = None
+    # Destinazione (Food / Beverage) da tabella destinazione_prodotto, usata per
+    # organizzare le categorie nello schema visuale in Gestione Categorie.
+    id_destinazione_prodotti: Optional[int] = None
 
 class CategoriaProdottoUpdate(BaseModel):
     nome_categoria: Optional[str] = None
     id_macro_categoria: Optional[int] = None
+    id_destinazione_prodotti: Optional[int] = None
 
 class ArticoloCreate(BaseModel):
     nome_articolo: str

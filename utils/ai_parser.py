@@ -172,7 +172,8 @@ Regole:
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
 """
         max_retries = 3
-        chunk_result = None
+        parsed_chunk = None
+        last_error = None
 
         async with sem:
             for attempt in range(max_retries):
@@ -185,27 +186,28 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
                         ],
                         config=types.GenerateContentConfig(
                             temperature=0.1,
-                            max_output_tokens=8192,
+                            max_output_tokens=16384,
+                            # Estrazione dati deterministica: nessun ragionamento necessario.
+                            # Senza disabilitarlo, il "thinking" di gemini-2.5-flash consuma
+                            # una quota variabile dello stesso max_output_tokens, troncando
+                            # a volte il JSON finale prima che sia completo (stringhe non
+                            # terminate) — da qui gli errori intermittenti "blocco N".
+                            thinking_config=types.ThinkingConfig(thinking_budget=0),
                             response_mime_type="application/json",
                             response_schema=ParsedVenditaResult,
                         )
                     )
-                    chunk_result = response.text
+                    parsed_chunk = json.loads(response.text)
                     break
                 except Exception as e:
+                    last_error = e
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2)
                         continue
-                    raise ValueError(f"Errore AI dopo {max_retries} tentativi nel blocco {idx}: {str(e)}")
 
-        if chunk_result:
-            try:
-                parsed_chunk = json.loads(chunk_result)
-                return parsed_chunk.get("vendite", [])
-            except Exception as e:
-                # Se per caso si è interrotto comunque, proviamo a recuperare le vendite valide col regex o falliamo
-                raise ValueError(f"Errore parsing JSON nel blocco {idx}: {str(e)}\nOutput troncato: {chunk_result[:100]}...")
-        return []
+        if parsed_chunk is not None:
+            return parsed_chunk.get("vendite", [])
+        raise ValueError(f"Errore AI/parsing dopo {max_retries} tentativi nel blocco {idx}: {str(last_error)}")
 
     # Creazione dei task
     tasks = []

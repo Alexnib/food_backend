@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
 from models.produzione import *
 from utils.auth_utils import get_user_sede
+from utils.numbers import round2
 
 router = APIRouter(prefix="/api/produzione", tags=["Produzione e Ricette"])
 supabase = Database.get_client()
@@ -89,8 +90,8 @@ def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
             "id_categoria_prodotto": data.id_categoria_prodotto,
             "id_sede": id_sede,
             "costo_ricetta_reale": 0.0,
-            "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
-            "prezzo_vendita_netto": data.prezzo_vendita_netto,
+            "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
+            "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
             "id_iva_vendita": data.id_iva_vendita
         }
         res_ricetta = supabase.table("ricette").insert(ricetta_insert).execute()
@@ -110,8 +111,8 @@ def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
 
         supabase.table("ricette").update({
             "costo_ricetta_reale": costo_finale,
-            "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
-            "prezzo_vendita_netto": data.prezzo_vendita_netto,
+            "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
+            "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
             "id_iva_vendita": data.id_iva_vendita
         }).eq("id", id_ricetta_creata).execute()
 
@@ -136,7 +137,7 @@ def get_ricette(auth_data = Depends(get_user_sede)):
     offset = 0
     page_size = 500  # batch più piccolo: ogni riga include ingredienti nidificati, payload più pesante
     while True:
-        batch = supabase.table("ricette").select(select_query).eq("id_sede", id_sede).range(offset, offset + page_size - 1).execute()
+        batch = supabase.table("ricette").select(select_query).eq("id_sede", id_sede).eq("is_cancelled", False).range(offset, offset + page_size - 1).execute()
         rows = batch.data or []
         tutte_le_ricette.extend(rows)
         if len(rows) < page_size:
@@ -169,8 +170,8 @@ def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_se
             "descrizione_ricetta": data.descrizione_ricetta,
             "id_categoria_prodotto": data.id_categoria_prodotto,
             "costo_ricetta_reale": costo_finale,
-            "prezzo_vendita_lordo": data.prezzo_vendita_lordo,
-            "prezzo_vendita_netto": data.prezzo_vendita_netto,
+            "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
+            "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
             "id_iva_vendita": data.id_iva_vendita
         }
         res = supabase.table("ricette").update(update_data).eq("id", id).eq("id_sede", id_sede).execute()
@@ -181,12 +182,30 @@ def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_se
 
 @router.delete("/ricette/{id}")
 def delete_ricetta(id: str, auth_data = Depends(get_user_sede)):
+    """Se la ricetta ha vendite registrate, eliminazione "soft" (is_cancelled=true):
+    ricetta e ingredienti restano intatti a DB, sparisce solo dai picker di nuove
+    vendite/ricette, mentre le vendite già registrate continuano a risalire al
+    suo nome/prezzo storico.
+    Se NON ha vendite, eliminazione reale: vengono rimossi anche gli ingredienti
+    (ingredienti_ricetta) di questa ricetta, ma MAI gli articoli/materie prime che
+    referenziava — quelli sono entità indipendenti e restano a catalogo."""
     try:
+        id_sede = auth_data["id_sede"]
+
+        vendite_res = supabase.table("vendite").select("id").eq("id_ricetta", id).limit(1).execute()
+        if vendite_res.data:
+            res = supabase.table("ricette").update({"is_cancelled": True}).eq("id", id).eq("id_sede", id_sede).execute()
+            if not res.data:
+                raise HTTPException(status_code=404, detail="Ricetta non trovata o non autorizzato.")
+            return {"message": "Ricetta eliminata"}
+
         supabase.table("ingredienti_ricetta").delete().eq("id_ricetta", id).execute()
-        res = supabase.table("ricette").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+        res = supabase.table("ricette").delete().eq("id", id).eq("id_sede", id_sede).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Ricetta non trovata o non autorizzato.")
         return {"message": "Ricetta eliminata"}
+    except HTTPException:
+        raise
     except Exception as e:
-        if "23503" in str(e):
-            raise HTTPException(status_code=400, detail="Impossibile eliminare: questa ricetta è usata nei prodotti finiti o ha vendite registrate.")
         raise HTTPException(status_code=400, detail=str(e))
 
