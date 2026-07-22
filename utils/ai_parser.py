@@ -122,15 +122,18 @@ async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: 
             # pd.read_excel senza sheet_name legge SOLO il primo foglio del
             # file, ignorando gli altri in silenzio: con file multi-foglio
             # (es. uno "ricette" e uno "vendite") rischiamo di analizzare il
-            # foglio sbagliato. Cerchiamo esplicitamente un foglio il cui nome
-            # contenga "vendit*"; se non lo troviamo (file a foglio singolo,
-            # il caso comune) restiamo sul primo foglio come prima.
+            # foglio sbagliato. Il nome del foglio non è affidabile (dipende
+            # da chi ha esportato il file, e in pratica capita che il foglio
+            # vendite non si chiami affatto "vendite"), quindi non ci basiamo
+            # su quello: leggiamo TUTTI i fogli e prendiamo quello con più
+            # righe di dati. Un log vendite (una riga per transazione) è
+            # sempre molto più grande di un catalogo ricette/prodotti, quindi
+            # questo distingue i due casi in modo affidabile indipendentemente
+            # da come sono chiamati i fogli.
             excel_file = pd.ExcelFile(io.BytesIO(excel_file_bytes))
-            sheet_name = next(
-                (s for s in excel_file.sheet_names if "vendit" in s.strip().lower()),
-                excel_file.sheet_names[0]
-            )
-            df = excel_file.parse(sheet_name)
+            fogli = {nome: excel_file.parse(nome) for nome in excel_file.sheet_names}
+            nome_foglio_scelto = max(fogli, key=lambda nome: len(fogli[nome]))
+            df = fogli[nome_foglio_scelto]
     except Exception as e:
         raise ValueError(f"Errore nella lettura del file: {str(e)}")
 
@@ -184,7 +187,11 @@ Regole:
 
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
 """
-        max_retries = 3
+        # Retry con backoff esponenziale (2s, 4s, 8s, 16s, 32s): un errore 503
+        # "modello sovraccarico" da parte di Gemini è quasi sempre temporaneo
+        # (pochi secondi/minuti), ma con un'attesa fissa di soli 2s e 3
+        # tentativi un blocco può esaurirli prima che il sovraccarico rientri.
+        max_retries = 5
         parsed_chunk = None
         last_error = None
 
@@ -215,12 +222,22 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
                 except Exception as e:
                     last_error = e
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2 ** attempt)
                         continue
 
         if parsed_chunk is not None:
-            return parsed_chunk.get("vendite", [])
-        raise ValueError(f"Errore AI/parsing dopo {max_retries} tentativi nel blocco {idx}: {str(last_error)}")
+            return {"vendite": parsed_chunk.get("vendite", []), "errore": None}
+
+        # Un blocco fallito non deve far perdere TUTTE le vendite già estratte
+        # dagli altri blocchi: lo segnaliamo (con l'intervallo di righe del
+        # file coinvolto) invece di sollevare un'eccezione che interromperebbe
+        # l'intero import.
+        riga_da = start_row + 1
+        riga_a = start_row + len(chunk_df)
+        return {
+            "vendite": [],
+            "errore": f"Righe {riga_da}-{riga_a} del file: {str(last_error)}",
+        }
 
     # Creazione dei task
     tasks = []
@@ -228,12 +245,15 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
         tasks.append(process_chunk(idx, i))
 
     completed_chunks = 0
+    blocchi_falliti = []
     # Aspettiamo il completamento man mano che finiscono
     for future in asyncio.as_completed(tasks):
-        vendite = await future
-        all_vendite.extend(vendite)
+        esito = await future
+        all_vendite.extend(esito["vendite"])
+        if esito["errore"]:
+            blocchi_falliti.append(esito["errore"])
         completed_chunks += 1
-        
+
         # Invio evento di progresso
         progress_pct = int((completed_chunks / total_chunks) * 100)
         yield json.dumps({"progress": progress_pct}) + "\n"
@@ -241,6 +261,12 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
     final_json = json.dumps({"vendite": all_vendite})
     # Validazione Pydantic
     ParsedVenditaResult.model_validate_json(final_json)
-    
-    # Invio evento di completamento e risultato finale
-    yield json.dumps({"result": {"vendite": all_vendite}}) + "\n"
+
+    # Invio evento di completamento e risultato finale. Se uno o più blocchi
+    # sono falliti (es. sovraccarico temporaneo dell'AI) dopo tutti i
+    # tentativi, lo segnaliamo con gli intervalli di righe coinvolti: il resto
+    # del file, comunque estratto correttamente, non va perso.
+    result_payload = {"vendite": all_vendite}
+    if blocchi_falliti:
+        result_payload["errori_parziali"] = blocchi_falliti
+    yield json.dumps({"result": result_payload}) + "\n"
