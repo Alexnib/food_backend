@@ -119,7 +119,18 @@ async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: 
         if filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(excel_file_bytes))
         else:
-            df = pd.read_excel(io.BytesIO(excel_file_bytes))
+            # pd.read_excel senza sheet_name legge SOLO il primo foglio del
+            # file, ignorando gli altri in silenzio: con file multi-foglio
+            # (es. uno "ricette" e uno "vendite") rischiamo di analizzare il
+            # foglio sbagliato. Cerchiamo esplicitamente un foglio il cui nome
+            # contenga "vendit*"; se non lo troviamo (file a foglio singolo,
+            # il caso comune) restiamo sul primo foglio come prima.
+            excel_file = pd.ExcelFile(io.BytesIO(excel_file_bytes))
+            sheet_name = next(
+                (s for s in excel_file.sheet_names if "vendit" in s.strip().lower()),
+                excel_file.sheet_names[0]
+            )
+            df = excel_file.parse(sheet_name)
     except Exception as e:
         raise ValueError(f"Errore nella lettura del file: {str(e)}")
 
@@ -168,6 +179,8 @@ Regole:
 4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA del file CSV fornitoti. Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide nel CSV.
 5. 'prezzo_singolo' e 'prezzo_totale' (OPZIONALI): SOLO se il file contiene colonne di prezzo per quella riga. 'prezzo_singolo' è il prezzo di UNA unità del prodotto; 'prezzo_totale' è il ricavo complessivo della riga (prezzo_singolo * quantita, o un importo già totale presente nel file). Estrai quello/i che trovi così come sono scritti, senza inventarli né calcolarli tu se manca l'informazione: se il file NON ha nessuna colonna riconducibile a un prezzo/importo/ricavo, lascia ENTRAMBI i campi a null. Se trovi solo uno dei due (es. solo il totale di riga, o solo il prezzo unitario), valorizza solo quello e lascia l'altro a null.
 6. 'prezzo_lordo' (SOLO se hai estratto un prezzo, altrimenti null): stabilisci se i prezzi della colonna sono NETTI (prezzo di listino impostato dal ristoratore) o LORDI (IVA inclusa, tipicamente copiati da uno scontrino). Guardali nel loro insieme: i prezzi NETTI di listino sono quasi sempre cifre "pulite" e tonde, come 10, 10.5, 12, 15.5, 3, 8 — impostate a mano dal gestore; i prezzi LORDI risultano invece da un calcolo con l'IVA e hanno più spesso centesimi "strani" e non tondi, come 8.80, 13.31, 4.95, 11.90. Valuta la colonna nel suo complesso: se la maggior parte dei valori sono cifre tonde, imposta 'prezzo_lordo' a false (sono netti) per tutte le righe; se la maggior parte hanno decimali irregolari, imposta 'prezzo_lordo' a true (sono lordi, il sistema li convertirà in netto usando l'aliquota IVA del prodotto). Se sei in dubbio, preferisci false (netto), che è il caso più comune per un listino.
+7. Se il file contiene PIÙ colonne di importo per la stessa riga, e alcune sono esplicitamente etichettate come lorde/"con IVA" e altre come nette/"netto IVA" (es. intestazioni tipo "Vendite Tot (con iva)" e "Vendite Tot (netto iva)"): IGNORA l'euristica del punto 6 in questo caso (serve solo quando c'è una sola colonna ambigua e non è chiaro se sia lorda o netta). Usa invece SEMPRE la colonna esplicitamente NETTA come prezzo_totale (o prezzo_singolo se è un valore per unità anziché un totale di riga), imposta 'prezzo_lordo' a false, e ignora del tutto la colonna lorda/con IVA: il valore netto è già quello che serve, non va scorporato di nuovo dall'IVA.
+8. Ignora completamente colonne che non riguardano la vendita in sé: food cost, margine, categoria/famiglia del prodotto, o colonne di supporto calcolate dalla data (anno, mese, giorno della settimana). Non fanno parte dello schema richiesto: non estrarle, non sommarle e non usarle per dedurre altri campi.
 
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
 """
