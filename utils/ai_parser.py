@@ -290,7 +290,7 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
             for attempt in range(max_retries):
                 try:
                     response = await client.aio.models.generate_content(
-                        model='gemini-3.6-flash',
+                        model='gemini-2.5-flash',
                         contents=[
                             prompt,
                             f"Dati caricati:\n```csv\n{csv_string}\n```"
