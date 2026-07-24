@@ -261,7 +261,7 @@ Il tuo compito è estrarre l'elenco delle vendite e restituirlo come un JSON che
       "data_vendita": "YYYY-MM-DD",
       "prezzo_singolo": 4.5,
       "prezzo_totale": 47.25,
-      "prezzo_lordo": false
+      "prezzo_lordo": true
     }}
   ]
 }}
@@ -272,8 +272,8 @@ Regole:
 3. 'data_vendita': Trasforma qualsiasi formato di data presente nel file nel formato ISO "YYYY-MM-DD" (es: 2026-07-13). Se non è presente una data in una riga, cerca di dedurla dalle righe precedenti.
 4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA del file CSV fornitoti. Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide nel CSV.
 5. 'prezzo_singolo' e 'prezzo_totale' (OPZIONALI): SOLO se il file contiene colonne di prezzo per quella riga. 'prezzo_singolo' è il prezzo di UNA unità del prodotto; 'prezzo_totale' è il ricavo complessivo della riga (prezzo_singolo * quantita, o un importo già totale presente nel file). Estrai quello/i che trovi così come sono scritti, senza inventarli né calcolarli tu se manca l'informazione: se il file NON ha nessuna colonna riconducibile a un prezzo/importo/ricavo, lascia ENTRAMBI i campi a null. Se trovi solo uno dei due (es. solo il totale di riga, o solo il prezzo unitario), valorizza solo quello e lascia l'altro a null.
-6. 'prezzo_lordo' (SOLO se hai estratto un prezzo, altrimenti null): un file di vendite come questo esporta quasi sempre l'incasso REALE per riga — cioè quello che il cliente ha pagato, IVA inclusa (LORDO) — non un prezzo di listino teorico. Per questo motivo, IMPOSTA SEMPRE 'prezzo_lordo' a true per default: il sistema si occupa già di scorporare l'IVA e verificare/correggere il risultato contro il listino del prodotto abbinato, quindi partire dal lordo è la scelta sicura anche quando hai dei dubbi. Fai eccezione (metti 'prezzo_lordo' a false) SOLO se il file dichiara ESPLICITAMENTE e senza ambiguità che quella colonna è già netta/imponibile (es. un'intestazione di colonna che dice letteralmente "netto" o "imponibile") — mai basandoti solo su come "sembrano" i decimali: sia i prezzi netti che quelli lordi possono essere cifre tonde o con centesimi, a seconda di come il gestore ha impostato i prezzi del locale, quindi quell'euristica visiva non è affidabile e non va usata.
-7. Se il file contiene PIÙ colonne di importo per la stessa riga, e alcune sono esplicitamente etichettate come lorde/"con IVA" e altre come nette/"netto IVA" (es. intestazioni tipo "Vendite Tot (con iva)" e "Vendite Tot (netto iva)"): questo è il caso in cui hai un'indicazione esplicita del punto 6. Usa SEMPRE la colonna esplicitamente NETTA come prezzo_totale (o prezzo_singolo se è un valore per unità anziché un totale di riga), imposta 'prezzo_lordo' a false, e ignora del tutto la colonna lorda/con IVA: il valore netto è già quello che serve, non va scorporato di nuovo dall'IVA.
+6. 'prezzo_lordo' (SOLO se hai estratto un prezzo, altrimenti null): imposta SEMPRE 'prezzo_lordo' a true, senza eccezioni — anche se una colonna sembra dichiararsi "netta"/"imponibile", anche se i decimali sembrano "puliti" o "strani" (nessuno di questi è un indizio affidabile: dipende solo da come il gestore ha impostato i prezzi del locale, non dal fatto che un valore sia netto o lordo). Un file di vendite come questo esporta l'incasso REALE per riga, cioè quello che il cliente ha pagato, IVA inclusa: è sempre lordo. Il netto lo scorpora il sistema a valle usando l'aliquota del prodotto abbinato (o quella indicata nel documento se nota) — non è un compito tuo, e non devi mai dedurlo, calcolarlo o "correggerlo" tu qui.
+7. Se il file contiene PIÙ colonne di importo per la stessa riga (es. una "lorda"/"con IVA" e una "netta"/"imponibile" affiancate): estrai il valore dalla colonna LORDA/con IVA come prezzo_singolo o prezzo_totale e ignora del tutto quella netta, anche se ti sembra più "pulita" o più affidabile. 'prezzo_lordo' resta comunque true, come da punto 6, senza eccezioni. Il sistema deriva sempre da solo il netto corretto; non affidarti mai a un netto già calcolato nel file, potrebbe essere impostato in modo incoerente col resto del listino.
 8. Ignora completamente colonne che non riguardano la vendita in sé: food cost, margine, categoria/famiglia del prodotto, o colonne di supporto calcolate dalla data (anno, mese, giorno della settimana). Non fanno parte dello schema richiesto: non estrarle, non sommarle e non usarle per dedurre altri campi.
 
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
@@ -290,7 +290,7 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
             for attempt in range(max_retries):
                 try:
                     response = await client.aio.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model='gemini-3.6-flash',
                         contents=[
                             prompt,
                             f"Dati caricati:\n```csv\n{csv_string}\n```"
