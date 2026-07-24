@@ -186,20 +186,25 @@ def _andamento_vendite(id_sede: str, data_inizio: str, data_fine_esclusiva: str,
         if not data_v:
             continue
         qta = s.get("quantita") or 0
+        # Il prezzo salvato su una vendita sospesa è SEMPRE lordo grezzo, mai
+        # netto: senza un prodotto abbinato non c'è un'aliquota IVA nota con
+        # cui scorporarlo in fase di inserimento (vedi registra_vendite_bulk,
+        # dove per una riga sospesa _scorpora_iva non ha un'aliquota da usare
+        # e restituisce il valore invariato). Va quindi trattato come lordo
+        # qui, non come netto.
         if s.get("prezzo_totale") is not None:
-            ricavo_netto = s["prezzo_totale"]
+            ricavo_lordo = s["prezzo_totale"]
         elif s.get("prezzo_singolo") is not None:
-            ricavo_netto = s["prezzo_singolo"] * qta
+            ricavo_lordo = s["prezzo_singolo"] * qta
         else:
-            ricavo_netto = 0.0  # nessun prodotto associato e nessun prezzo rilevato: non calcolabile
+            ricavo_lordo = 0.0  # nessun prodotto associato e nessun prezzo rilevato: non calcolabile
 
         riga = _riga(_chiave_periodo(data_v))
         # Senza prodotto associato non conosciamo l'aliquota IVA reale: usiamo
         # il 10% come stima ragionevole (l'aliquota più comune sul catalogo)
-        # invece di sommare il lordo uguale al netto, che sottostimerebbe
-        # sempre il lordo esattamente dell'importo dell'IVA non conteggiata.
-        riga["ricavi"] += ricavo_netto
-        riga["ricavi_lordo"] += round(ricavo_netto * 1.10, 2)
+        # per scorporare il lordo (quello davvero salvato) e stimare il netto.
+        riga["ricavi_lordo"] += ricavo_lordo
+        riga["ricavi"] += round(ricavo_lordo / 1.10, 2)
         riga["numero_vendite"] += 1
 
     return list(aggregato.values())

@@ -726,14 +726,25 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
         
         sospesa = res.data[0]
 
-        # Prezzo: se lo scontrino/excel l'aveva già rilevato sulla sospesa, resta quello;
-        # altrimenti, ora che il prodotto è noto, lo recuperiamo dal listino attuale.
-        prezzo_singolo = round2(sospesa.get("prezzo_singolo"))
-        prezzo_totale = round2(sospesa.get("prezzo_totale"))
-        if prezzo_singolo is None:
+        # Il prezzo salvato su una vendita sospesa è SEMPRE lordo grezzo, mai
+        # netto: senza un prodotto abbinato non c'era un'aliquota IVA nota con
+        # cui scorporarlo al momento dell'inserimento (vedi registra_vendite_bulk).
+        # Ora che il prodotto è noto, recuperiamo la sua aliquota reale e
+        # scorporiamo qui, per la prima volta, il valore in netto.
+        prezzo_lordo_sospesa = round2(sospesa.get("prezzo_singolo"))
+        if prezzo_lordo_sospesa is not None:
+            iva_ricette, iva_articoli = _get_iva_rates_batch(
+                [data.id_ricetta] if data.id_ricetta else [],
+                [data.id_prodotto_commerciale] if data.id_prodotto_commerciale else [],
+            )
+            iva_perc = iva_ricette.get(data.id_ricetta) if data.id_ricetta else iva_articoli.get(data.id_prodotto_commerciale)
+            prezzo_singolo = _scorpora_iva(prezzo_lordo_sospesa, iva_perc)
+        else:
+            # Nessun prezzo rilevato sullo scontrino/excel: usiamo il listino
+            # netto attuale del prodotto ora noto (già netto, nessuno scorporo).
             prezzo_singolo = round2(_get_listino_price(data.id_ricetta, data.id_prodotto_commerciale))
-        if prezzo_totale is None and prezzo_singolo is not None:
-            prezzo_totale = round(sospesa["quantita"] * prezzo_singolo, 2)
+
+        prezzo_totale = round(sospesa["quantita"] * prezzo_singolo, 2) if prezzo_singolo is not None else None
 
         # Solo ora che il prodotto è noto possiamo congelare food cost e
         # prezzo lordo, esattamente come su una vendita registrata subito con
