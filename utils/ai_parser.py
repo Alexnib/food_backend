@@ -1,11 +1,12 @@
 import os
 import time
+import json
 from google import genai
 from google.genai import types
 import pandas as pd
 from typing import List, Optional
 import io
-from models.magazzino import ParsedResult
+from models.magazzino import ParsedResult, FatturaParseResult
 
 def parse_excel_with_ai(excel_file_bytes: bytes, filename: str, categorie_disponibili: list) -> str:
     """
@@ -99,6 +100,97 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
                 raise ValueError(f"Errore parsing JSON nel blocco {i}: {str(e)}")
 
     return json.dumps({"prodotti": all_products})
+
+
+def parse_fattura_with_ai(files: List[tuple]) -> str:
+    """
+    Legge una o più fatture di acquisto (PDF o foto) e ne estrae fornitore,
+    partita IVA e le righe prodotto, tramite Gemini con input multimodale
+    diretto (niente OCR/parsing manuale: il documento va così com'è).
+
+    files: lista di tuple (contenuto_bytes, mime_type), una per ogni file
+    caricato. Ritorna la stringa JSON validata secondo lo schema
+    FatturaParseResult — {"fornitore", "partita_iva", "prodotti": [...]}.
+
+    Qui NON chiediamo all'AI di indovinare 'tipo' (Materia Prima/Rivendita)
+    o la categoria: a differenza dei dati tabellari di un file Excel, una
+    riga di fattura da sola non basta a dedurli in modo affidabile (dipende
+    da come il ristoratore usa quel prodotto nel proprio menù). Quella
+    scelta resta sempre dell'utente nella schermata di conferma, come già
+    per l'import da Excel.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY non configurata.")
+
+    client = genai.Client(api_key=api_key)
+
+    prompt = """
+Sei un assistente esperto in contabilità e acquisti per la ristorazione in Italia.
+Ti sto fornendo una o più fatture di acquisto (PDF o foto) ricevute da un fornitore.
+
+Individua prima le informazioni di TESTATA del documento:
+- 'fornitore': la ragione sociale dell'azienda che ha EMESSO la fattura (il venditore che vende, MAI l'azienda che la riceve/acquista).
+- 'partita_iva': la partita IVA del fornitore, se presente.
+Se ti ho fornito più fatture di fornitori diversi, usa quelle della fattura con più righe prodotto.
+
+Poi, per OGNI riga/prodotto elencata nel corpo di TUTTE le fatture fornite, estrai:
+1. 'nome_prodotto': la descrizione del prodotto/materiale acquistato, ripulita da eventuali codici articolo.
+2. 'unita_misura': l'unità di misura del prezzo UNITARIO (kg, g, lt, ml, pz). Se la fattura riporta un prezzo "a cassa"/"a confezione" con più pezzi dentro, calcola il prezzo per la singola unità base (es. prezzo a cassa da 6 bottiglie -> prezzo a bottiglia): non lasciare mai il prezzo dell'intera confezione.
+3. 'prezzo_acquisto_netto' e 'prezzo_acquisto_lordo': il prezzo UNITARIO (non il totale di riga, non il totale della fattura). Sulle fatture italiane il prezzo unitario riportato riga per riga è quasi sempre l'IMPONIBILE (netto, IVA esclusa): valorizza in quel caso 'prezzo_acquisto_netto' con quel valore. Se conosci l'aliquota IVA di quella riga, calcola anche 'prezzo_acquisto_lordo' = netto * (1 + iva/100), arrotondato a 2 decimali; altrimenti lascialo null. Se invece il documento indica ESPLICITAMENTE che il prezzo unitario riportato è già IVA inclusa, fai il ragionamento inverso.
+4. 'iva_percentuale': l'aliquota IVA di quella riga (es. 4, 10, 22). Se la fattura usa un codice IVA anziché la percentuale, deducila dal riepilogo IVA in fondo al documento.
+
+Regole generali:
+- NON includere righe di riepilogo, subtotali, sconti a piè di fattura, spese di trasporto/imballo/bolli, a meno che non siano beni/materiali effettivamente acquistati.
+- Se ti ho fornito PIÙ fatture insieme, elaborale TUTTE e restituisci le righe prodotto di ciascuna nello stesso array "prodotti", senza saltarne nessuna.
+- Se un valore richiesto non è determinabile con certezza dal documento, lascialo null piuttosto che inventarlo.
+
+Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto. Nessun commento o markdown.
+"""
+
+    parts = [prompt]
+    for content, mime_type in files:
+        parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
+
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                # Modello "pro": a differenza dell'import Excel (dati già
+                # tabellari, alto volume di righe, dove conta la velocità),
+                # qui il volume è basso (poche fatture alla volta) ma il
+                # documento è un PDF/foto dal layout reale e variabile da
+                # fornitore a fornitore — beneficia di un modello con
+                # ragionamento visivo più solido. Nessun thinking_config qui:
+                # sui modelli "pro" il thinking non si disattiva del tutto,
+                # meglio lasciargli il budget di default con un
+                # max_output_tokens generoso piuttosto che rischiare di
+                # troncare l'output (stesso problema già visto su flash).
+                model='gemini-2.5-pro',
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=32768,
+                    response_mime_type="application/json",
+                    response_schema=FatturaParseResult,
+                ),
+            )
+            parsed = json.loads(response.text)
+            for p in parsed.get("prodotti", []):
+                if p.get("prezzo_acquisto_netto") is not None:
+                    p["prezzo_acquisto_netto"] = round(float(p["prezzo_acquisto_netto"]), 2)
+                if p.get("prezzo_acquisto_lordo") is not None:
+                    p["prezzo_acquisto_lordo"] = round(float(p["prezzo_acquisto_lordo"]), 2)
+            return json.dumps(parsed)
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+
+    raise ValueError(f"Errore AI dopo {max_retries} tentativi: {str(last_error)}")
+
 
 async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: str):
     """

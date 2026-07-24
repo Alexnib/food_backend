@@ -3,8 +3,10 @@ from database.config import Database
 from models.vendite import *
 from utils.auth_utils import get_user_sede
 from utils.numbers import round2
+from utils.db_fetch import call_rpc_or_none, run_parallel, fetch_all_parallel
 from fastapi.responses import StreamingResponse
 import io
+import time
 import pandas as pd
 from datetime import date
 from openpyxl.styles import Font
@@ -79,6 +81,111 @@ def _scorpora_iva(prezzo_lordo, iva_perc):
     return round(prezzo_lordo / (1 + iva_perc / 100), 2)
 
 
+def _get_listino_lordo_netto_batch(ids_ricette, ids_commerciali):
+    """Prezzo di vendita netto E lordo ATTUALI dal listino, per prodotto —
+    usato per verificare/correggere la stima di prezzo_lordo dell'AI (vedi
+    _correggi_prezzo_lordo): a differenza di _get_listino_prices_batch, qui
+    serve anche il lordo, non solo il netto."""
+    listino_ricette = {}
+    if ids_ricette:
+        res = supabase.table("ricette").select("id, prezzo_vendita_netto, prezzo_vendita_lordo").in_("id", list(set(ids_ricette))).execute()
+        listino_ricette = {r["id"]: (r.get("prezzo_vendita_netto"), r.get("prezzo_vendita_lordo")) for r in (res.data or [])}
+    listino_articoli = {}
+    if ids_commerciali:
+        res = supabase.table("articoli").select("id, prezzo_vendita_netto, prezzo_vendita_lordo").in_("id", list(set(ids_commerciali))).execute()
+        listino_articoli = {a["id"]: (a.get("prezzo_vendita_netto"), a.get("prezzo_vendita_lordo")) for a in (res.data or [])}
+    return listino_ricette, listino_articoli
+
+
+def _correggi_prezzo_lordo(prezzo_grezzo, listino_netto, listino_lordo, ipotesi_ai):
+    """
+    L'AI stima se una colonna di prezzi è netta o lorda guardando se le cifre
+    sono "tonde" — un'euristica che si rivela SBAGLIATA per i listini dove
+    (come tipicamente in un locale) il prezzo tondo è quello mostrato al
+    cliente (lordo, IVA inclusa) e il netto è il decimale scorporato: in quel
+    caso l'AI scambia sistematicamente lordo per netto (visto in produzione:
+    un intero mese di vendite salvato con l'IVA raddoppiata di fatto).
+
+    Qui abbiamo un'informazione che l'AI non ha: il prodotto è già stato
+    abbinato a una riga di catalogo, quindi conosciamo il suo VERO prezzo
+    netto e lordo attuali. Se il prezzo grezzo estratto combacia chiaramente
+    con uno dei due (e non con l'altro), quella è un'evidenza più affidabile
+    della sola valutazione visiva dell'AI e la sostituisce. Se è ambiguo o
+    non c'è un match netto, ci fidiamo della stima dell'AI (invariata).
+    """
+    if prezzo_grezzo is None:
+        return ipotesi_ai
+    TOLLERANZA = 0.03
+    vicino_netto = listino_netto is not None and abs(prezzo_grezzo - listino_netto) < TOLLERANZA
+    vicino_lordo = listino_lordo is not None and abs(prezzo_grezzo - listino_lordo) < TOLLERANZA
+    if vicino_lordo and not vicino_netto:
+        return True
+    if vicino_netto and not vicino_lordo:
+        return False
+    return ipotesi_ai
+
+
+def _get_costi_lordi_batch(ids_ricette, ids_commerciali):
+    """Per un insieme di ricette/articoli, food cost unitario e aliquota IVA
+    di vendita ATTUALI — le materie prime per congelare lordo e food cost su
+    una vendita al momento in cui viene creata (vedi _snapshot_riga)."""
+    food_cost_ricette, iva_id_ricette = {}, {}
+    if ids_ricette:
+        res = supabase.table("ricette").select("id, costo_ricetta_reale, id_iva_vendita").in_("id", list(set(ids_ricette))).execute()
+        for r in res.data or []:
+            food_cost_ricette[r["id"]] = r.get("costo_ricetta_reale")
+            iva_id_ricette[r["id"]] = r.get("id_iva_vendita")
+
+    food_cost_articoli, iva_id_articoli = {}, {}
+    if ids_commerciali:
+        res = supabase.table("articoli").select("id, prezzo_acquisto_netto, id_iva_rivendita").in_("id", list(set(ids_commerciali))).execute()
+        for a in res.data or []:
+            food_cost_articoli[a["id"]] = a.get("prezzo_acquisto_netto")
+            iva_id_articoli[a["id"]] = a.get("id_iva_rivendita")
+
+    ids_iva = {v for v in list(iva_id_ricette.values()) + list(iva_id_articoli.values()) if v is not None}
+    perc_by_id_iva = {}
+    if ids_iva:
+        res = supabase.table("iva").select("id, iva").in_("id", list(ids_iva)).execute()
+        perc_by_id_iva = {row["id"]: row.get("iva") for row in (res.data or [])}
+
+    iva_perc_ricette = {pid: perc_by_id_iva.get(idiva) for pid, idiva in iva_id_ricette.items() if idiva is not None}
+    iva_perc_articoli = {pid: perc_by_id_iva.get(idiva) for pid, idiva in iva_id_articoli.items() if idiva is not None}
+    return food_cost_ricette, food_cost_articoli, iva_perc_ricette, iva_perc_articoli
+
+
+def _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, quantita, costi_lordi_batch):
+    """Congela su una riga di vendita food cost e prezzo lordo, usando i
+    valori ATTUALI di ricette/articoli passati in costi_lordi_batch (vedi
+    _get_costi_lordi_batch). Unica implementazione di questo calcolo: la
+    usano sia gli inserimenti singoli sia quelli bulk, per non rischiare due
+    formule che nel tempo divergono silenziosamente."""
+    food_cost_ricette, food_cost_articoli, iva_perc_ricette, iva_perc_articoli = costi_lordi_batch
+
+    food_cost_unitario = food_cost_ricette.get(id_ricetta) if id_ricetta else (food_cost_articoli.get(id_commerciale) if id_commerciale else None)
+    iva_perc = iva_perc_ricette.get(id_ricetta) if id_ricetta else (iva_perc_articoli.get(id_commerciale) if id_commerciale else None)
+
+    out = {"food_cost_unitario": None, "food_cost_totale": None, "prezzo_singolo_lordo": None, "prezzo_totale_lordo": None}
+    if food_cost_unitario is not None:
+        out["food_cost_unitario"] = round2(food_cost_unitario)
+        out["food_cost_totale"] = round(food_cost_unitario * (quantita or 0), 2)
+    if prezzo_singolo is not None and iva_perc is not None:
+        lordo_u = round2(prezzo_singolo * (1 + iva_perc / 100))
+        out["prezzo_singolo_lordo"] = lordo_u
+        out["prezzo_totale_lordo"] = round(lordo_u * (quantita or 0), 2)
+    return out
+
+
+def _snapshot_riga_singola(id_ricetta, id_commerciale, prezzo_singolo, quantita):
+    """Versione comoda di _snapshot_riga per un solo prodotto (endpoint non
+    bulk): recupera da sola i dati di ricette/articoli/iva necessari."""
+    batch = _get_costi_lordi_batch(
+        [id_ricetta] if id_ricetta else [],
+        [id_commerciale] if id_commerciale else [],
+    )
+    return _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, quantita, batch)
+
+
 @router.post("/bulk", status_code=status.HTTP_201_CREATED)
 def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_sede)):
     """
@@ -148,18 +255,36 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                 "id_commerciale": id_commerciale,
             })
 
+        # 1a-bis. Verifica/correzione della stima "prezzo_lordo" dell'AI
+        # contro il listino REALE del prodotto già abbinato (vedi
+        # _correggi_prezzo_lordo) — per tutte le righe con un prezzo e un
+        # prodotto riconosciuto, non solo quelle che l'AI ha segnato come
+        # lorde: serve a correggere anche il caso opposto (l'AI ha detto
+        # "netto" ma il prezzo è in realtà quello lordo di listino).
+        ids_ricette_listino = {p["id_ricetta"] for p in pending if p["id_ricetta"]}
+        ids_commerciali_listino = {p["id_commerciale"] for p in pending if p["id_commerciale"]}
+        listino_ricette, listino_articoli = _get_listino_lordo_netto_batch(list(ids_ricette_listino), list(ids_commerciali_listino))
+
+        for p in pending:
+            netto_l, lordo_l = (
+                listino_ricette.get(p["id_ricetta"]) if p["id_ricetta"]
+                else listino_articoli.get(p["id_commerciale"]) if p["id_commerciale"]
+                else (None, None)
+            ) or (None, None)
+            p["prezzo_lordo_corretto"] = _correggi_prezzo_lordo(p["prezzo_singolo"], netto_l, lordo_l, p["item"].prezzo_lordo)
+
         # 1b. Per le righe marcate come LORDE (scontrino/comanda, o excel con
         # prezzi riconosciuti come tali) e senza un'aliquota già nota dal
         # documento, recuperiamo in batch l'aliquota IVA di vendita del
         # prodotto associato, per poterle scorporare in netto.
         ids_ricette_iva = {
             p["id_ricetta"] for p in pending
-            if p["item"].prezzo_lordo and p["prezzo_singolo"] is not None
+            if p["prezzo_lordo_corretto"] and p["prezzo_singolo"] is not None
             and p["item"].iva_percentuale is None and p["id_ricetta"]
         }
         ids_commerciali_iva = {
             p["id_commerciale"] for p in pending
-            if p["item"].prezzo_lordo and p["prezzo_singolo"] is not None
+            if p["prezzo_lordo_corretto"] and p["prezzo_singolo"] is not None
             and p["item"].iva_percentuale is None and p["id_commerciale"]
         }
         iva_ricette, iva_articoli = _get_iva_rates_batch(list(ids_ricette_iva), list(ids_commerciali_iva))
@@ -174,7 +299,7 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
             id_commerciale = p["id_commerciale"]
             prezzo_singolo_item = p["prezzo_singolo"]
 
-            if item.prezzo_lordo and prezzo_singolo_item is not None:
+            if p["prezzo_lordo_corretto"] and prezzo_singolo_item is not None:
                 iva_perc = item.iva_percentuale
                 if iva_perc is None:
                     iva_perc = iva_ricette.get(id_ricetta) if id_ricetta else iva_articoli.get(id_commerciale)
@@ -247,6 +372,13 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                     _, id_ricetta_k, id_commerciale_k, _ = key
                     group["prezzo_singolo"] = listino_ricette.get(id_ricetta_k) if id_ricetta_k else listino_articoli.get(id_commerciale_k)
 
+            # Food cost e prezzo lordo ATTUALI di tutti i prodotti coinvolti, in
+            # batch — per congelarli su ogni riga nuova o aggiornata (vedi
+            # _snapshot_riga più sotto).
+            ids_ricette_snapshot = {k[1] for k in valid_vendite_grouped.keys() if k[1]}
+            ids_commerciali_snapshot = {k[2] for k in valid_vendite_grouped.keys() if k[2]}
+            costi_lordi_batch = _get_costi_lordi_batch(list(ids_ricette_snapshot), list(ids_commerciali_snapshot))
+
             vendite_to_upsert = []
             for key, group in valid_vendite_grouped.items():
                 data_vendita, id_ricetta, id_commerciale, _ = key
@@ -259,6 +391,18 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                     sale = existing_sales_dict[key]
                     new_quantita = sale["quantita"] + quantita_da_aggiungere
                     prezzo_singolo = round2(sale.get("prezzo_singolo") if sale.get("prezzo_singolo") is not None else group["prezzo_singolo"])
+
+                    # Stesso principio del prezzo: se la riga esistente ha già uno
+                    # snapshot congelato, lo teniamo (non lo sostituiamo col dato di
+                    # oggi solo perché arriva altra quantità); ricalcoliamo solo i
+                    # totali sulla nuova quantità complessiva.
+                    fc_unitario = sale.get("food_cost_unitario")
+                    pl_unitario = sale.get("prezzo_singolo_lordo")
+                    if fc_unitario is None or pl_unitario is None:
+                        fresh = _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, new_quantita, costi_lordi_batch)
+                        fc_unitario = fc_unitario if fc_unitario is not None else fresh["food_cost_unitario"]
+                        pl_unitario = pl_unitario if pl_unitario is not None else fresh["prezzo_singolo_lordo"]
+
                     vendite_to_upsert.append({
                         "id": sale["id"],
                         "data_vendita": data_vendita,
@@ -268,9 +412,14 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                         "id_prodotto_commerciale": id_commerciale,
                         "prezzo_singolo": prezzo_singolo,
                         "prezzo_totale": round(new_quantita * prezzo_singolo, 2) if prezzo_singolo is not None else None,
+                        "food_cost_unitario": fc_unitario,
+                        "food_cost_totale": round(fc_unitario * new_quantita, 2) if fc_unitario is not None else None,
+                        "prezzo_singolo_lordo": pl_unitario,
+                        "prezzo_totale_lordo": round(pl_unitario * new_quantita, 2) if pl_unitario is not None else None,
                     })
                 else:
                     prezzo_singolo = round2(group["prezzo_singolo"])
+                    snap = _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, quantita_da_aggiungere, costi_lordi_batch)
                     vendite_to_upsert.append({
                         "data_vendita": data_vendita,
                         "quantita": quantita_da_aggiungere,
@@ -279,6 +428,7 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                         "id_prodotto_commerciale": id_commerciale,
                         "prezzo_singolo": prezzo_singolo,
                         "prezzo_totale": round(quantita_da_aggiungere * prezzo_singolo, 2) if prezzo_singolo is not None else None,
+                        **snap,
                     })
 
             if vendite_to_upsert:
@@ -325,6 +475,23 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
             if prezzo_finale is not None:
                 update_payload["prezzo_singolo"] = prezzo_finale
                 update_payload["prezzo_totale"] = round(new_quantita * prezzo_finale, 2)
+
+            # Stesso principio del prezzo: se la riga ha già uno snapshot
+            # congelato lo teniamo, altrimenti lo calcoliamo ora; in ogni caso
+            # ribasiamo i totali sulla nuova quantità complessiva.
+            fc_unitario = existing_record.get("food_cost_unitario")
+            pl_unitario = existing_record.get("prezzo_singolo_lordo")
+            if fc_unitario is None or pl_unitario is None:
+                fresh = _snapshot_riga_singola(data.id_ricetta, data.id_prodotto_commerciale, prezzo_finale, new_quantita)
+                fc_unitario = fc_unitario if fc_unitario is not None else fresh["food_cost_unitario"]
+                pl_unitario = pl_unitario if pl_unitario is not None else fresh["prezzo_singolo_lordo"]
+            if fc_unitario is not None:
+                update_payload["food_cost_unitario"] = fc_unitario
+                update_payload["food_cost_totale"] = round(fc_unitario * new_quantita, 2)
+            if pl_unitario is not None:
+                update_payload["prezzo_singolo_lordo"] = pl_unitario
+                update_payload["prezzo_totale_lordo"] = round(pl_unitario * new_quantita, 2)
+
             res = supabase.table("vendite").update(update_payload).eq("id", existing_record["id"]).execute()
             return res.data[0]
         else:
@@ -337,10 +504,57 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
             elif prezzo_singolo is not None:
                 insert_data["prezzo_totale"] = round(data.quantita * prezzo_singolo, 2)
 
+            snap = _snapshot_riga_singola(data.id_ricetta, data.id_prodotto_commerciale, prezzo_singolo, data.quantita)
+            insert_data.update(snap)
+
             res = supabase.table("vendite").insert(insert_data).execute()
             return res.data[0]
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# NOTA: /bulk-prezzo deve restare PRIMA di /{id} qui sotto. Starlette prova le
+# rotte nell'ordine di registrazione: /{id} (PUT) è un pattern a un solo
+# segmento e "cattura" anche la stringa "bulk-prezzo" prima che si arrivi mai
+# a valutare la rotta statica sottostante, con un 422 da FastAPI che prova a
+# convertirla in int (bug preesistente, non introdotto da queste modifiche —
+# la modifica prezzi in blocco non ha mai funzionato per questo).
+@router.put("/bulk-prezzo")
+def aggiorna_prezzo_bulk(data: VenditaBulkPrezzoUpdate, auth_data = Depends(get_user_sede)):
+    """Applica lo stesso nuovo prezzo unitario a un insieme di vendite già
+    registrate (selezionate dall'utente in /per-prodotto), ricalcolando il
+    totale di riga in base alla quantità già salvata su ciascuna."""
+    if not data.ids:
+        return {"message": "Nessuna vendita selezionata."}
+
+    nuovo_prezzo = round2(data.nuovo_prezzo_singolo)
+    if nuovo_prezzo is None or nuovo_prezzo < 0:
+        raise HTTPException(status_code=400, detail="Prezzo non valido.")
+
+    res = supabase.table("vendite").select("id, quantita, id_ricetta, id_prodotto_commerciale").in_("id", data.ids).eq("id_sede", auth_data["id_sede"]).execute()
+    righe = res.data or []
+
+    # Il netto cambia: il lordo va ricalcolato sulla nuova base (aliquota IVA
+    # ATTUALE del prodotto), altrimenti resterebbe legato al vecchio prezzo.
+    # Il food cost non dipende dal prezzo di vendita e resta quello già
+    # congelato sulla riga, non lo tocchiamo.
+    ids_ricette = {r["id_ricetta"] for r in righe if r.get("id_ricetta")}
+    ids_commerciali = {r["id_prodotto_commerciale"] for r in righe if r.get("id_prodotto_commerciale")}
+    costi_lordi_batch = _get_costi_lordi_batch(list(ids_ricette), list(ids_commerciali))
+
+    aggiornate = 0
+    for riga in righe:
+        snap = _snapshot_riga(riga.get("id_ricetta"), riga.get("id_prodotto_commerciale"), nuovo_prezzo, riga["quantita"], costi_lordi_batch)
+        payload = {
+            "prezzo_singolo": nuovo_prezzo,
+            "prezzo_totale": round(riga["quantita"] * nuovo_prezzo, 2),
+        }
+        if snap["prezzo_singolo_lordo"] is not None:
+            payload["prezzo_singolo_lordo"] = snap["prezzo_singolo_lordo"]
+            payload["prezzo_totale_lordo"] = snap["prezzo_totale_lordo"]
+        supabase.table("vendite").update(payload).eq("id", riga["id"]).execute()
+        aggiornate += 1
+
+    return {"message": f"{aggiornate} vendite aggiornate"}
 
 @router.put("/{id}")
 def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get_user_sede)):
@@ -355,14 +569,41 @@ def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get_user_
         if "prezzo_totale" in update_data:
             update_data["prezzo_totale"] = round2(update_data["prezzo_totale"])
 
+        existing_res = supabase.table("vendite").select(
+            "quantita, prezzo_singolo, id_ricetta, id_prodotto_commerciale, "
+            "food_cost_unitario, prezzo_singolo_lordo"
+        ).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+        if not existing_res.data:
+            raise HTTPException(status_code=404, detail="Vendita non trovata o non autorizzato.")
+        existing = existing_res.data[0]
+
         # Se cambia la quantità ma non viene passato un nuovo prezzo totale,
         # lo ricalcoliamo dal prezzo unitario già salvato (o da quello nuovo, se passato).
         if "quantita" in update_data and "prezzo_totale" not in update_data:
-            existing_res = supabase.table("vendite").select("prezzo_singolo").eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
-            if existing_res.data:
-                prezzo_singolo = update_data.get("prezzo_singolo", existing_res.data[0].get("prezzo_singolo"))
-                if prezzo_singolo is not None:
-                    update_data["prezzo_totale"] = round(update_data["quantita"] * prezzo_singolo, 2)
+            prezzo_singolo = update_data.get("prezzo_singolo", existing.get("prezzo_singolo"))
+            if prezzo_singolo is not None:
+                update_data["prezzo_totale"] = round(update_data["quantita"] * prezzo_singolo, 2)
+
+        quantita_finale = update_data.get("quantita", existing.get("quantita"))
+        id_ricetta_finale = update_data.get("id_ricetta", existing.get("id_ricetta"))
+        id_commerciale_finale = update_data.get("id_prodotto_commerciale", existing.get("id_prodotto_commerciale"))
+
+        if "id_ricetta" in update_data or "id_prodotto_commerciale" in update_data or "prezzo_singolo" in update_data:
+            # Il prodotto o il prezzo netto sono cambiati: lo snapshot di lordo/
+            # food-cost era legato a quelli, non ha più senso preservarlo — lo
+            # ricalcoliamo da zero sui valori di catalogo ATTUALI.
+            prezzo_singolo_finale = update_data.get("prezzo_singolo", existing.get("prezzo_singolo"))
+            snap = _snapshot_riga_singola(id_ricetta_finale, id_commerciale_finale, prezzo_singolo_finale, quantita_finale)
+            update_data.update(snap)
+        elif "quantita" in update_data:
+            # Cambia solo la quantità: l'unitario congelato resta quello, si
+            # ribasano solo i totali.
+            fc_unitario = existing.get("food_cost_unitario")
+            pl_unitario = existing.get("prezzo_singolo_lordo")
+            if fc_unitario is not None:
+                update_data["food_cost_totale"] = round(fc_unitario * quantita_finale, 2)
+            if pl_unitario is not None:
+                update_data["prezzo_totale_lordo"] = round(pl_unitario * quantita_finale, 2)
 
         res = supabase.table("vendite").update(update_data).eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
         if not res.data:
@@ -376,18 +617,20 @@ def get_vendite_summary(auth_data = Depends(get_user_sede)):
     """Restituisce il riepilogo delle vendite raggruppato per mese (YYYY-MM)."""
     id_sede = auth_data["id_sede"]
 
-    # Paginazione per superare il limite di righe di Supabase (stesso pattern di GET "/")
-    data = []
-    page = 0
-    page_size = 1000
-    while True:
-        res = supabase.table("vendite").select("data_vendita, quantita").eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
-        if not res.data:
-            break
-        data.extend(res.data)
-        if len(res.data) < page_size:
-            break
-        page += 1
+    # Percorso veloce: GROUP BY per mese direttamente in Postgres (vedi
+    # sql/003_statistiche_rpc.sql) — viaggia solo una riga per mese, qualunque
+    # sia il numero di vendite. Stessa forma e stesso ordinamento del fallback.
+    rows = call_rpc_or_none("stat_vendite_summary", {"p_id_sede": id_sede}, order_cols=["-mese"])
+    if rows is not None:
+        return rows
+
+    # Fallback (funzione SQL non ancora creata): scarica le date e conta in
+    # Python, con le pagine oltre la prima recuperate in parallelo.
+    def make_query(with_count):
+        return supabase.table("vendite").select(
+            "data_vendita, quantita", count="exact" if with_count else None
+        ).eq("id_sede", id_sede)
+    data = fetch_all_parallel(make_query)
 
     summary = {}
     for item in data:
@@ -396,10 +639,10 @@ def get_vendite_summary(auth_data = Depends(get_user_sede)):
         month = item["data_vendita"][:7] # YYYY-MM
         if month not in summary:
             summary[month] = {"mese": month, "numero_operazioni": 0, "quantita_totale": 0}
-        
+
         summary[month]["numero_operazioni"] += 1
         summary[month]["quantita_totale"] += item.get("quantita", 0)
-        
+
     # Ordina per mese decrescente (i più recenti prima)
     result_list = sorted(list(summary.values()), key=lambda x: x["mese"], reverse=True)
     return result_list
@@ -440,31 +683,6 @@ def get_vendite_per_prodotto(
         page += 1
 
     return all_data
-
-@router.put("/bulk-prezzo")
-def aggiorna_prezzo_bulk(data: VenditaBulkPrezzoUpdate, auth_data = Depends(get_user_sede)):
-    """Applica lo stesso nuovo prezzo unitario a un insieme di vendite già
-    registrate (selezionate dall'utente in /per-prodotto), ricalcolando il
-    totale di riga in base alla quantità già salvata su ciascuna."""
-    if not data.ids:
-        return {"message": "Nessuna vendita selezionata."}
-
-    nuovo_prezzo = round2(data.nuovo_prezzo_singolo)
-    if nuovo_prezzo is None or nuovo_prezzo < 0:
-        raise HTTPException(status_code=400, detail="Prezzo non valido.")
-
-    res = supabase.table("vendite").select("id, quantita").in_("id", data.ids).eq("id_sede", auth_data["id_sede"]).execute()
-    righe = res.data or []
-
-    aggiornate = 0
-    for riga in righe:
-        supabase.table("vendite").update({
-            "prezzo_singolo": nuovo_prezzo,
-            "prezzo_totale": round(riga["quantita"] * nuovo_prezzo, 2),
-        }).eq("id", riga["id"]).execute()
-        aggiornate += 1
-
-    return {"message": f"{aggiornate} vendite aggiornate"}
 
 @router.get("/sospese")
 def get_vendite_sospese(auth_data = Depends(get_user_sede)):
@@ -511,6 +729,11 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
         if prezzo_totale is None and prezzo_singolo is not None:
             prezzo_totale = round(sospesa["quantita"] * prezzo_singolo, 2)
 
+        # Solo ora che il prodotto è noto possiamo congelare food cost e
+        # prezzo lordo, esattamente come su una vendita registrata subito con
+        # il prodotto già associato.
+        snap = _snapshot_riga_singola(data.id_ricetta, data.id_prodotto_commerciale, prezzo_singolo, sospesa["quantita"])
+
         # Crea la vendita reale
         record = {
             "data_vendita": sospesa["data_vendita"],
@@ -520,6 +743,7 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
             "id_prodotto_commerciale": data.id_prodotto_commerciale,
             "prezzo_singolo": prezzo_singolo,
             "prezzo_totale": prezzo_totale,
+            **snap,
         }
 
         # Inserisci in vendite
@@ -533,43 +757,62 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# Aliquote IVA per prodotto della sede, con una piccola cache: servono solo a
+# mostrare il prezzo lordo in elenco vendite e cambiano rarissimamente — senza
+# cache erano 3 query in più su OGNI apertura della pagina Vendite.
+_IVA_SEDE_CACHE: dict = {}
+_IVA_SEDE_TTL = 60  # secondi
+
+
+def _get_iva_rates_sede(id_sede: str):
+    cached = _IVA_SEDE_CACHE.get(id_sede)
+    if cached and (time.time() - cached[0]) < _IVA_SEDE_TTL:
+        return cached[1], cached[2]
+
+    res_r, res_a, res_iva = run_parallel(
+        lambda: supabase.table("ricette").select("id, id_iva_vendita").eq("id_sede", id_sede).execute(),
+        lambda: supabase.table("articoli").select("id, id_iva_rivendita").eq("id_sede", id_sede).execute(),
+        lambda: supabase.table("iva").select("id, iva").execute(),
+    )
+    perc_by_id_iva = {row["id"]: row.get("iva") for row in (res_iva.data or [])}
+    iva_ricette = {r["id"]: perc_by_id_iva.get(r.get("id_iva_vendita")) for r in (res_r.data or []) if r.get("id_iva_vendita") is not None}
+    iva_articoli = {a["id"]: perc_by_id_iva.get(a.get("id_iva_rivendita")) for a in (res_a.data or []) if a.get("id_iva_rivendita") is not None}
+
+    _IVA_SEDE_CACHE[id_sede] = (time.time(), iva_ricette, iva_articoli)
+    return iva_ricette, iva_articoli
+
+
 @router.get("/")
 def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_sede)):
-    # Recupera le vendite unendo i nomi delle ricette e dei prodotti commerciali per comodità visiva
-    query = supabase.table("vendite").select(
-        "*, ricette(nome_ricetta), articoli(nome_articolo)"
-    ).eq("id_sede", auth_data["id_sede"])
-    
-    if month:
-        y, m = map(int, month.split('-'))
-        last_day = calendar.monthrange(y, m)[1]
-        start_date = f"{month}-01"
-        end_date = f"{month}-{last_day}"
-        query = query.gte("data_vendita", start_date).lte("data_vendita", end_date)
-        
-    # Paginazione per superare il limite di 1000 righe di Supabase
-    all_data = []
-    page = 0
-    page_size = 1000
-    while True:
-        res = query.range(page * page_size, (page + 1) * page_size - 1).execute()
-        if not res.data:
-            break
-        all_data.extend(res.data)
-        if len(res.data) < page_size:
-            break
-        page += 1
+    # Recupera le vendite unendo i nomi delle ricette e dei prodotti commerciali
+    # per comodità visiva. La prima pagina viaggia con count esatto, così le
+    # pagine successive partono in parallelo invece che in sequenza; le aliquote
+    # IVA (per il lordo) arrivano dalla cache di sede qui sopra.
+    def make_query(with_count):
+        q = supabase.table("vendite").select(
+            "*, ricette(nome_ricetta), articoli(nome_articolo)",
+            count="exact" if with_count else None,
+        ).eq("id_sede", auth_data["id_sede"])
+        if month:
+            y, m = map(int, month.split('-'))
+            last_day = calendar.monthrange(y, m)[1]
+            q = q.gte("data_vendita", f"{month}-01").lte("data_vendita", f"{month}-{last_day}")
+        return q
 
-    # Prezzo di vendita lordo (IVA inclusa), calcolato al volo dall'aliquota IVA
-    # ATTUALE del prodotto: i prezzi salvati sono sempre netti (vedi conversione
-    # in /bulk), il lordo è solo per la visualizzazione e non viene mai salvato.
-    # Riflette l'aliquota di oggi, non necessariamente quella in vigore al
-    # momento della vendita (non la conserviamo per singola riga).
-    ids_ricette = [r["id_ricetta"] for r in all_data if r.get("id_ricetta")]
-    ids_commerciali = [r["id_prodotto_commerciale"] for r in all_data if r.get("id_prodotto_commerciale")]
-    iva_ricette, iva_articoli = _get_iva_rates_batch(ids_ricette, ids_commerciali)
+    all_data, (iva_ricette, iva_articoli) = run_parallel(
+        lambda: fetch_all_parallel(make_query),
+        lambda: _get_iva_rates_sede(auth_data["id_sede"]),
+    )
+
+    # Prezzo di vendita lordo: select("*") lo porta già con la riga se è stato
+    # congelato al momento della vendita (vedi sql/004+005). Il calcolo al
+    # volo dall'aliquota IVA ATTUALE resta solo come fallback per righe senza
+    # snapshot (nessuna, dopo il backfill 005) — riflette l'aliquota di oggi,
+    # non necessariamente quella in vigore al momento della vendita.
 
     for r in all_data:
+        if r.get("prezzo_singolo_lordo") is not None and r.get("prezzo_totale_lordo") is not None:
+            continue
         iva_perc = iva_ricette.get(r["id_ricetta"]) if r.get("id_ricetta") else iva_articoli.get(r.get("id_prodotto_commerciale"))
         if iva_perc is not None and r.get("prezzo_singolo") is not None:
             # Il totale lordo si deriva SEMPRE dall'unitario lordo già arrotondato
@@ -580,9 +823,6 @@ def get_vendite(month: Optional[str] = None, auth_data = Depends(get_user_sede))
             # indipendenti (es. 4.55 * 1.10 = 5.00 ma 54.60 * 1.10 / 12 = 5.005).
             r["prezzo_singolo_lordo"] = round2(r["prezzo_singolo"] * (1 + iva_perc / 100))
             r["prezzo_totale_lordo"] = round2(r["prezzo_singolo_lordo"] * (r.get("quantita") or 0))
-        else:
-            r["prezzo_singolo_lordo"] = None
-            r["prezzo_totale_lordo"] = None
 
     return all_data
 

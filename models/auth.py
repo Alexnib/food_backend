@@ -30,7 +30,7 @@ class UserRegister(BaseModel):
     password: str
     nome: str
     cognome: str
-    cellulare: Optional[str] = None
+    cellulare: str
     id_sede: Optional[UUID]  = None
     # Il ruolo NON è un campo scelto da chi si registra: ogni nuova utenza
     # nasce sempre come "user" (id 2 nella tabella roles). Un eventuale
@@ -41,6 +41,14 @@ class UserRegister(BaseModel):
     @classmethod
     def check_password_strength(cls, v: str) -> str:
         return validate_password_strength(v)
+
+    @field_validator("cellulare")
+    @classmethod
+    def check_cellulare(cls, v: str) -> str:
+        v = v.strip()
+        if len(re.sub(r"\D", "", v)) < 6:
+            raise ValueError("Numero di cellulare non valido")
+        return v
 
 class RefreshTokenRequest(BaseModel):
     refresh_token: str

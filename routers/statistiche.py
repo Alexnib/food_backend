@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from database.config import Database
 from utils.auth_utils import get_user_sede
+from utils.db_fetch import call_rpc_or_none, run_parallel, fetch_all_parallel
 from datetime import datetime, timedelta
 import calendar
 
@@ -8,56 +9,160 @@ router = APIRouter(prefix="/api/statistiche", tags=["Statistiche e P&L"])
 supabase = Database.get_client()
 
 
-def _andamento_vendite_python(id_sede: str, data_inizio: str, data_fine_esclusiva: str, group_by: str) -> list:
-    """
-    Sostituisce la (ex) funzione SQL stat_andamento_vendite. Calcola l'andamento
-    delle vendite (ricavi, ricavi_lordo, food_cost, numero_vendite) raggruppato
-    per giorno o mese ("day"/"month"), con le stesse chiavi di output che aveva
-    la RPC, così da poter essere usata come sostituto diretto.
+# ============================================================================
+# Mattone comune: vendite aggregate per (giorno, prodotto).
+#
+# Percorso veloce: la funzione SQL stat_vendite_aggregate (sql/003) fa il
+# GROUP BY dentro Postgres — viaggia solo il risultato, qualunque sia la
+# dimensione della tabella vendite. Se la funzione non è ancora stata creata
+# sul database, il fallback Python produce ESATTAMENTE le stesse righe
+# scaricando i dati grezzi (com'era prima, ma con fetch in parallelo).
+# Tutti gli endpoint statistiche derivano da queste righe: un'unica logica
+# di prezzo (prezzo salvato sulla vendita, poi listino) in un unico posto.
+# ============================================================================
 
-    Differenze volute rispetto alla vecchia RPC:
-    - I ricavi usano il prezzo REALMENTE applicato alla vendita (vendite.prezzo_totale
-      o prezzo_singolo*quantita), non più il prezzo attuale di listino: un cambio
-      prezzo futuro non altera più le vendite passate. Il listino resta solo un
-      fallback per righe non ancora "backfillate" (vedi sql/001_backfill_prezzo_vendite.sql).
-    - Include anche vendite_sospese: sono vendite reali, solo non ancora abbinate
-      a un prodotto specifico, quindi contano nei ricavi totali dell'attività
-      (ma non nel food cost, che richiede un prodotto per essere calcolato).
-    - Il food cost resta invece calcolato sui costi ATTUALI di ricette/articoli:
-      non esiste (ancora) uno storico dei costi ingredienti al momento della vendita.
+def _vendite_aggregate(id_sede: str, data_inizio: str = None, data_fine_esclusiva: str = None) -> list:
     """
-    page_size = 1000
-
-    def _fetch_all(table_name: str, select_cols: str):
-        rows = []
-        page = 0
-        while True:
-            res = supabase.table(table_name).select(select_cols).eq("id_sede", id_sede)\
-                .gte("data_vendita", data_inizio).lt("data_vendita", data_fine_esclusiva)\
-                .range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            rows.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
+    Righe: {giorno, id_ricetta, id_prodotto_commerciale, quantita,
+            num_vendite, ricavo_netto, ricavo_lordo, food_cost}
+    - ricavo_netto: prezzo REALMENTE applicato (prezzo_totale, poi
+      prezzo_singolo*quantita, infine listino attuale come ultima spiaggia).
+    - ricavo_lordo / food_cost: valore congelato sulla vendita al momento
+      dell'inserimento (prezzo_totale_lordo/food_cost_totale, vedi sql/004+
+      005), così un mese chiuso non si muove più se cambi una ricetta o un
+      prezzo di acquisto oggi. Il rapporto lordo/netto e il costo ATTUALI di
+      ricette/articoli restano solo come fallback per vendite senza snapshot.
+    """
+    rows = call_rpc_or_none(
+        "stat_vendite_aggregate",
+        {
+            "p_id_sede": id_sede,
+            "p_data_inizio": data_inizio,
+            "p_data_fine_esclusiva": data_fine_esclusiva,
+        },
+        # Chiave del GROUP BY della funzione: ordinamento deterministico per
+        # la paginazione (vedi call_rpc_or_none).
+        order_cols=["giorno", "id_ricetta", "id_prodotto_commerciale"],
+    )
+    if rows is not None:
         return rows
 
-    vendite_data = _fetch_all("vendite", "quantita, data_vendita, id_ricetta, id_prodotto_commerciale, prezzo_singolo, prezzo_totale")
-    sospese_data = _fetch_all("vendite_sospese", "quantita, data_vendita, prezzo_singolo, prezzo_totale")
+    # ---- Fallback Python (stesso output della funzione SQL) ----
+    def _vendite():
+        def make_query(with_count):
+            q = supabase.table("vendite").select(
+                "quantita, data_vendita, id_ricetta, id_prodotto_commerciale, "
+                "prezzo_singolo, prezzo_totale, prezzo_singolo_lordo, prezzo_totale_lordo, "
+                "food_cost_unitario, food_cost_totale",
+                count="exact" if with_count else None,
+            ).eq("id_sede", id_sede)
+            if data_inizio:
+                q = q.gte("data_vendita", data_inizio)
+            if data_fine_esclusiva:
+                q = q.lt("data_vendita", data_fine_esclusiva)
+            return q
+        return fetch_all_parallel(make_query)
 
-    ids_ricette = {v["id_ricetta"] for v in vendite_data if v.get("id_ricetta")}
-    ids_commerciali = {v["id_prodotto_commerciale"] for v in vendite_data if v.get("id_prodotto_commerciale")}
+    def _ricette():
+        res = supabase.table("ricette").select(
+            "id, prezzo_vendita_netto, prezzo_vendita_lordo, costo_ricetta_reale"
+        ).eq("id_sede", id_sede).execute()
+        return {r["id"]: r for r in (res.data or [])}
 
-    ricette_map = {}
-    if ids_ricette:
-        res = supabase.table("ricette").select("id, prezzo_vendita_netto, prezzo_vendita_lordo, costo_ricetta_reale").in_("id", list(ids_ricette)).execute()
-        ricette_map = {r["id"]: r for r in (res.data or [])}
+    def _articoli():
+        res = supabase.table("articoli").select(
+            "id, prezzo_vendita_netto, prezzo_vendita_lordo, prezzo_acquisto_netto"
+        ).eq("id_sede", id_sede).execute()
+        return {a["id"]: a for a in (res.data or [])}
 
-    articoli_map = {}
-    if ids_commerciali:
-        res = supabase.table("articoli").select("id, prezzo_vendita_netto, prezzo_vendita_lordo, prezzo_acquisto_netto").in_("id", list(ids_commerciali)).execute()
-        articoli_map = {a["id"]: a for a in (res.data or [])}
+    vendite_data, ricette_map, articoli_map = run_parallel(_vendite, _ricette, _articoli)
+
+    aggregato = {}
+    for v in vendite_data:
+        giorno = (v.get("data_vendita") or "")[:10]
+        if not giorno:
+            continue
+        qta = v.get("quantita") or 0
+        id_r = v.get("id_ricetta")
+        id_c = v.get("id_prodotto_commerciale")
+
+        anagrafica = ricette_map.get(id_r) if id_r is not None else articoli_map.get(id_c)
+        if anagrafica and id_r is not None:
+            food_cost_u = anagrafica.get("costo_ricetta_reale") or 0.0
+        elif anagrafica:
+            food_cost_u = anagrafica.get("prezzo_acquisto_netto") or 0.0
+        else:
+            food_cost_u = 0.0
+        listino_netto = (anagrafica.get("prezzo_vendita_netto") or 0.0) if anagrafica else 0.0
+        listino_lordo = (anagrafica.get("prezzo_vendita_lordo") or 0.0) if anagrafica else 0.0
+
+        if v.get("prezzo_totale") is not None:
+            ricavo_netto = v["prezzo_totale"]
+        elif v.get("prezzo_singolo") is not None:
+            ricavo_netto = v["prezzo_singolo"] * qta
+        else:
+            ricavo_netto = listino_netto * qta
+
+        # Lordo e food cost: preferiamo lo snapshot congelato sulla vendita
+        # (vedi sql/004+005); il calcolo dal listino ATTUALE resta solo come
+        # fallback per righe senza snapshot (nessuna, dopo il backfill 005).
+        if v.get("prezzo_totale_lordo") is not None:
+            ricavo_lordo = v["prezzo_totale_lordo"]
+        elif v.get("prezzo_singolo_lordo") is not None:
+            ricavo_lordo = v["prezzo_singolo_lordo"] * qta
+        else:
+            rapporto_lordo = (listino_lordo / listino_netto) if listino_netto > 0 else 1.0
+            ricavo_lordo = ricavo_netto * rapporto_lordo
+
+        if v.get("food_cost_totale") is not None:
+            food_cost_riga = v["food_cost_totale"]
+        elif v.get("food_cost_unitario") is not None:
+            food_cost_riga = v["food_cost_unitario"] * qta
+        else:
+            food_cost_riga = food_cost_u * qta
+
+        key = (giorno, id_r, id_c)
+        if key not in aggregato:
+            aggregato[key] = {
+                "giorno": giorno, "id_ricetta": id_r, "id_prodotto_commerciale": id_c,
+                "quantita": 0.0, "num_vendite": 0,
+                "ricavo_netto": 0.0, "ricavo_lordo": 0.0, "food_cost": 0.0,
+            }
+        riga = aggregato[key]
+        riga["quantita"] += qta
+        riga["num_vendite"] += 1
+        riga["ricavo_netto"] += ricavo_netto
+        riga["ricavo_lordo"] += ricavo_lordo
+        riga["food_cost"] += food_cost_riga
+    return list(aggregato.values())
+
+
+def _sospese_rows(id_sede: str, data_inizio: str = None, data_fine_esclusiva: str = None) -> list:
+    """Vendite sospese del periodo (tabella per natura piccola: righe in attesa
+    di associazione, che vengono risolte o eliminate)."""
+    def make_query(with_count):
+        q = supabase.table("vendite_sospese").select(
+            "quantita, data_vendita, prezzo_singolo, prezzo_totale",
+            count="exact" if with_count else None,
+        ).eq("id_sede", id_sede)
+        if data_inizio:
+            q = q.gte("data_vendita", data_inizio)
+        if data_fine_esclusiva:
+            q = q.lt("data_vendita", data_fine_esclusiva)
+        return q
+    return fetch_all_parallel(make_query)
+
+
+def _andamento_vendite(id_sede: str, data_inizio: str, data_fine_esclusiva: str, group_by: str) -> list:
+    """
+    Andamento per periodo (giorno o mese): {periodo, ricavi, ricavi_lordo,
+    food_cost, numero_vendite}. Include le vendite sospese nei ricavi/numero
+    (sono vendite reali non ancora abbinate a un prodotto), non nel food cost.
+    """
+    righe_aggregate, sospese_data = run_parallel(
+        lambda: _vendite_aggregate(id_sede, data_inizio, data_fine_esclusiva),
+        lambda: _sospese_rows(id_sede, data_inizio, data_fine_esclusiva),
+    )
 
     def _chiave_periodo(data_iso: str) -> str:
         return data_iso[:10] if group_by == "day" else data_iso[:7]
@@ -69,47 +174,12 @@ def _andamento_vendite_python(id_sede: str, data_inizio: str, data_fine_esclusiv
             aggregato[chiave] = {"periodo": chiave, "ricavi": 0.0, "ricavi_lordo": 0.0, "food_cost": 0.0, "numero_vendite": 0}
         return aggregato[chiave]
 
-    for v in vendite_data:
-        data_v = (v.get("data_vendita") or "")[:10]
-        if not data_v:
-            continue
-        qta = v.get("quantita") or 0
-
-        anagrafica = None
-        food_cost_u = 0.0
-        if v.get("id_ricetta") is not None:
-            anagrafica = ricette_map.get(v["id_ricetta"])
-            if anagrafica:
-                food_cost_u = anagrafica.get("costo_ricetta_reale") or 0.0
-        elif v.get("id_prodotto_commerciale") is not None:
-            anagrafica = articoli_map.get(v["id_prodotto_commerciale"])
-            if anagrafica:
-                food_cost_u = anagrafica.get("prezzo_acquisto_netto") or 0.0
-
-        listino_netto = (anagrafica.get("prezzo_vendita_netto") or 0.0) if anagrafica else 0.0
-        listino_lordo = (anagrafica.get("prezzo_vendita_lordo") or 0.0) if anagrafica else 0.0
-
-        # Ricavo netto realmente applicato: prima il totale salvato sulla vendita,
-        # poi l'unitario salvato, infine il listino attuale come ultima spiaggia
-        # (solo per vendite registrate prima del backfill).
-        if v.get("prezzo_totale") is not None:
-            ricavo_netto = v["prezzo_totale"]
-        elif v.get("prezzo_singolo") is not None:
-            ricavo_netto = v["prezzo_singolo"] * qta
-        else:
-            ricavo_netto = listino_netto * qta
-
-        # Il lordo non è mai stato salvato sulla vendita: lo stimiamo applicando
-        # al ricavo netto reale il rapporto lordo/netto ATTUALE del prodotto
-        # (l'aliquota IVA cambia raramente, è un'approssimazione ragionevole).
-        rapporto_lordo = (listino_lordo / listino_netto) if listino_netto > 0 else 1.0
-        ricavo_lordo = ricavo_netto * rapporto_lordo
-
-        riga = _riga(_chiave_periodo(data_v))
-        riga["ricavi"] += ricavo_netto
-        riga["ricavi_lordo"] += ricavo_lordo
-        riga["food_cost"] += food_cost_u * qta
-        riga["numero_vendite"] += 1
+    for r in righe_aggregate:
+        riga = _riga(_chiave_periodo(r["giorno"]))
+        riga["ricavi"] += r.get("ricavo_netto") or 0.0
+        riga["ricavi_lordo"] += r.get("ricavo_lordo") or 0.0
+        riga["food_cost"] += r.get("food_cost") or 0.0
+        riga["numero_vendite"] += r.get("num_vendite") or 0
 
     for s in sospese_data:
         data_v = (s.get("data_vendita") or "")[:10]
@@ -124,9 +194,12 @@ def _andamento_vendite_python(id_sede: str, data_inizio: str, data_fine_esclusiv
             ricavo_netto = 0.0  # nessun prodotto associato e nessun prezzo rilevato: non calcolabile
 
         riga = _riga(_chiave_periodo(data_v))
-        # Senza prodotto non c'è modo di stimare un lordo diverso dal netto.
+        # Senza prodotto associato non conosciamo l'aliquota IVA reale: usiamo
+        # il 10% come stima ragionevole (l'aliquota più comune sul catalogo)
+        # invece di sommare il lordo uguale al netto, che sottostimerebbe
+        # sempre il lordo esattamente dell'importo dell'IVA non conteggiata.
         riga["ricavi"] += ricavo_netto
-        riga["ricavi_lordo"] += ricavo_netto
+        riga["ricavi_lordo"] += round(ricavo_netto * 1.10, 2)
         riga["numero_vendite"] += 1
 
     return list(aggregato.values())
@@ -165,15 +238,12 @@ def get_overview(periodo: str = "this_month", custom_start: str = None, custom_e
         data_fine = data_fine_date.strftime("%Y-%m-%d")
         data_fine_inclusiva = (data_fine_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 1. Andamento delle vendite (ricavi/food cost), calcolato dal prezzo
-        # REALMENTE applicato su vendite/vendite_sospese — non più dal listino attuale.
-        andamento_vendite = _andamento_vendite_python(
-            id_sede, data_inizio_globali, data_fine_inclusiva, "day" if is_daily else "month"
+        # 1+2. Andamento delle vendite (dal prezzo REALMENTE applicato su
+        # vendite/vendite_sospese) e costi fissi: fetch indipendenti, in parallelo.
+        andamento_vendite, costi_data = run_parallel(
+            lambda: _andamento_vendite(id_sede, data_inizio_globali, data_fine_inclusiva, "day" if is_daily else "month"),
+            lambda: (supabase.table("costi_anno_mese").select("*").eq("id_sede", id_sede).execute().data or []),
         )
-
-        # 2. Recupera Costi Fissi
-        costi_res = supabase.table("costi_anno_mese").select("*").eq("id_sede", id_sede).execute()
-        costi_data = costi_res.data or []
         
         costi_fissi_mensili = {}
         for c in costi_data:
@@ -320,14 +390,11 @@ def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
     try:
         id_sede = auth_data["id_sede"]
 
-        # 1. Recupera TUTTI i Costi Generali (Fissi + Extra) dell'anno scelto
-        costi_res = supabase.table("costi_anno_mese").select("*").eq("id_sede", id_sede).eq("anno", anno).execute()
-        costi_data = costi_res.data or []
-
-        # 2. Andamento mensile delle vendite dell'anno, dal prezzo REALMENTE
-        # applicato su vendite/vendite_sospese — non più dal listino attuale.
-        andamento_vendite = _andamento_vendite_python(
-            id_sede, f"{anno}-01-01", f"{anno + 1}-01-01", "month"
+        # 1+2. Costi generali dell'anno e andamento mensile delle vendite (dal
+        # prezzo REALMENTE applicato): fetch indipendenti, in parallelo.
+        andamento_vendite, costi_data = run_parallel(
+            lambda: _andamento_vendite(id_sede, f"{anno}-01-01", f"{anno + 1}-01-01", "month"),
+            lambda: (supabase.table("costi_anno_mese").select("*").eq("id_sede", id_sede).eq("anno", anno).execute().data or []),
         )
 
         # 3. Prepariamo il contenitore vuoto per i 12 mesi
@@ -426,61 +493,39 @@ def get_food_cost_analytics(
         data_fine_inclusiva = (data_fine_date + timedelta(days=1)).strftime("%Y-%m-%d")
         delta_days = (data_fine_date - data_inizio_date).days
 
-        # --- 1. Recupera le vendite del periodo (solo i campi essenziali, paginato:
-        # una vendita può facilmente superare le 1000 righe di default di Supabase). ---
-        vendite_data = []
-        page = 0
-        page_size = 1000
-        while True:
-            res = supabase.table("vendite").select(
-                "quantita, data_vendita, id_ricetta, id_prodotto_commerciale, prezzo_singolo, prezzo_totale"
-            ).eq("id_sede", id_sede)\
-             .gte("data_vendita", data_inizio_str)\
-             .lt("data_vendita", data_fine_inclusiva)\
-             .range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            vendite_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
+        # --- 1..3. Quattro fetch indipendenti, in parallelo: vendite già
+        # AGGREGATE per (giorno, prodotto) — via funzione SQL se disponibile,
+        # altrimenti fallback equivalente — più anagrafiche di ricette (con
+        # albero ingredienti, per il breakdown), articoli e categorie. ---
+        def _ricette_tree():
+            def make_query(with_count):
+                return supabase.table("ricette").select(
+                    "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, "
+                    "ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(nome_articolo, prezzo_acquisto_netto))",
+                    count="exact" if with_count else None,
+                ).eq("id_sede", id_sede)
+            return fetch_all_parallel(make_query)
 
-        # --- 2. Recupera UNA SOLA VOLTA i dati "anagrafici" di ricette e articoli
-        # (prezzo, costo, ingredienti), invece di rifare il join per ogni singola
-        # vendita: lo stesso prodotto venduto 500 volte in un mese scaricherebbe
-        # altrimenti 500 volte l'intero albero ingredienti_ricetta->articoli. ---
-        ricette_data = []
-        page = 0
-        while True:
-            res = supabase.table("ricette").select(
-                "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, "
-                "ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(nome_articolo, prezzo_acquisto_netto))"
-            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            ricette_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
+        def _articoli_light():
+            def make_query(with_count):
+                return supabase.table("articoli").select(
+                    "id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto, id_categoria_prodotto",
+                    count="exact" if with_count else None,
+                ).eq("id_sede", id_sede)
+            return fetch_all_parallel(make_query)
+
+        def _categorie():
+            res = supabase.table("categoria_prodotti").select("id, nome_categoria").eq("id_sede", id_sede).execute()
+            return {c["id"]: c["nome_categoria"] for c in (res.data or [])}
+
+        righe_aggregate, ricette_data, articoli_data, categorie_map = run_parallel(
+            lambda: _vendite_aggregate(id_sede, data_inizio_str, data_fine_inclusiva),
+            _ricette_tree,
+            _articoli_light,
+            _categorie,
+        )
         ricette_map = {r["id"]: r for r in ricette_data}
-
-        articoli_data = []
-        page = 0
-        while True:
-            res = supabase.table("articoli").select(
-                "id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto, id_categoria_prodotto"
-            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            articoli_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
         articoli_map = {a["id"]: a for a in articoli_data}
-
-        # --- 3. Recupera categorie per i nomi ---
-        cat_res = supabase.table("categoria_prodotti").select("id, nome_categoria").eq("id_sede", id_sede).execute()
-        categorie_map = {c["id"]: c["nome_categoria"] for c in (cat_res.data or [])}
 
         # --- 4. Variabili di aggregazione ---
         totale_ricavi = 0.0
@@ -501,46 +546,32 @@ def get_food_cost_analytics(
         # Distribuzione per categoria { id_cat: { nome, ricavi, fc } }
         categorie_dict = {}
 
-        # --- 5. Elaborazione vendite ---
-        for v in vendite_data:
-            qta = v.get("quantita", 0)
-            data_v = (v.get("data_vendita") or "")[:10]
-            if not data_v:
-                continue
+        # --- 5. Elaborazione delle righe GIÀ aggregate per (giorno, prodotto):
+        # il lavoro per-vendita è stato fatto dal database (o dal fallback),
+        # qui restano solo somme su poche centinaia di righe. ---
+        qta_per_ricetta = {}  # id_ricetta -> porzioni vendute nel periodo (per il breakdown ingredienti)
 
-            fc_u = 0.0
-            listino_netto = 0.0
-            nome_prodotto = ""
-            id_cat = None
-            ingredienti_ricetta = []
+        for r in righe_aggregate:
+            qta = r.get("quantita") or 0
+            data_v = (r.get("giorno") or "")[:10]
+            ricavo_tot = r.get("ricavo_netto") or 0.0
+            fc_tot = r.get("food_cost") or 0.0
 
-            id_ricetta = v.get("id_ricetta")
-            id_prodotto = v.get("id_prodotto_commerciale")
+            id_ricetta = r.get("id_ricetta")
+            id_prodotto = r.get("id_prodotto_commerciale")
             ricetta = ricette_map.get(id_ricetta) if id_ricetta is not None else None
             riv = articoli_map.get(id_prodotto) if id_prodotto is not None else None
 
             if ricetta:
-                listino_netto = ricetta.get("prezzo_vendita_netto", 0) or 0
-                fc_u = ricetta.get("costo_ricetta_reale", 0) or 0
                 nome_prodotto = ricetta.get("nome_ricetta", "N/D")
                 id_cat = ricetta.get("id_categoria_prodotto")
-                ingredienti_ricetta = ricetta.get("ingredienti_ricetta") or []
+                qta_per_ricetta[id_ricetta] = qta_per_ricetta.get(id_ricetta, 0) + qta
             elif riv:
-                listino_netto = riv.get("prezzo_vendita_netto", 0) or 0
-                fc_u = riv.get("prezzo_acquisto_netto", 0) or 0
                 nome_prodotto = riv.get("nome_articolo", "N/D")
                 id_cat = riv.get("id_categoria_prodotto")
-
-            # Ricavo REALMENTE applicato alla vendita: prima il totale salvato,
-            # poi l'unitario salvato, infine il listino attuale come ultima
-            # spiaggia (solo per vendite non ancora "backfillate").
-            if v.get("prezzo_totale") is not None:
-                ricavo_tot = v["prezzo_totale"]
-            elif v.get("prezzo_singolo") is not None:
-                ricavo_tot = v["prezzo_singolo"] * qta
             else:
-                ricavo_tot = listino_netto * qta
-            fc_tot = fc_u * qta
+                nome_prodotto = "N/D"
+                id_cat = None
 
             totale_ricavi += ricavo_tot
             totale_food_cost += fc_tot
@@ -564,8 +595,13 @@ def get_food_cost_analytics(
                 trend_dict[data_v]["ricavi"] += ricavo_tot
                 trend_dict[data_v]["food_cost"] += fc_tot
 
-            # Ingredienti (solo per prodotti del menu con ricette)
-            for ing in ingredienti_ricetta:
+        # Ingredienti: l'albero di ogni ricetta viene percorso UNA volta sola,
+        # pesato per le porzioni totali vendute nel periodo.
+        for id_ricetta, porzioni in qta_per_ricetta.items():
+            ricetta = ricette_map.get(id_ricetta)
+            if not ricetta:
+                continue
+            for ing in (ricetta.get("ingredienti_ricetta") or []):
                 mp = ing.get("articoli") or {}
                 nome_ing = mp.get("nome_articolo", "N/D")
                 costo_netto_mp = mp.get("prezzo_acquisto_netto", 0) or 0
@@ -573,8 +609,7 @@ def get_food_cost_analytics(
                 perc_scarto = ing.get("perc_scarto", 0) or 0
                 resa = 1 - (perc_scarto / 100)
                 qta_eff = (qta_per_kg / resa) if resa > 0 else qta_per_kg
-                costo_ing_per_piatto = qta_eff * costo_netto_mp
-                costo_ing_totale = costo_ing_per_piatto * qta  # moltiplicato per le porzioni vendute
+                costo_ing_totale = qta_eff * costo_netto_mp * porzioni
 
                 if nome_ing not in ingredienti_dict:
                     ingredienti_dict[nome_ing] = {"nome": nome_ing, "costo_totale": 0.0, "costo_netto_unitario": costo_netto_mp}
@@ -805,93 +840,57 @@ def get_andamento_prodotti(
         data_inizio_str = data_inizio_date.strftime("%Y-%m-%d")
         data_fine_inclusiva = (data_fine_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # --- 1. Vendite del periodo (paginato) ---
-        vendite_data = []
-        page = 0
-        page_size = 1000
-        while True:
-            res = supabase.table("vendite").select(
-                "quantita, data_vendita, id_ricetta, id_prodotto_commerciale, prezzo_singolo, prezzo_totale"
-            ).eq("id_sede", id_sede)\
-             .gte("data_vendita", data_inizio_str)\
-             .lt("data_vendita", data_fine_inclusiva)\
-             .range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            vendite_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
+        # --- 1+2. Vendite già aggregate per (giorno, prodotto) — via funzione
+        # SQL se disponibile — e anagrafiche leggere, in parallelo. ---
+        def _ricette_light():
+            def make_query(with_count):
+                return supabase.table("ricette").select(
+                    "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale",
+                    count="exact" if with_count else None,
+                ).eq("id_sede", id_sede)
+            return fetch_all_parallel(make_query)
 
-        # --- 2. Anagrafica ricette e articoli, recuperata una sola volta ---
-        ricette_data = []
-        page = 0
-        while True:
-            res = supabase.table("ricette").select(
-                "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale"
-            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            ricette_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
+        def _articoli_light():
+            def make_query(with_count):
+                return supabase.table("articoli").select(
+                    "id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto",
+                    count="exact" if with_count else None,
+                ).eq("id_sede", id_sede)
+            return fetch_all_parallel(make_query)
+
+        righe_aggregate, ricette_data, articoli_data = run_parallel(
+            lambda: _vendite_aggregate(id_sede, data_inizio_str, data_fine_inclusiva),
+            _ricette_light,
+            _articoli_light,
+        )
         ricette_map = {r["id"]: r for r in ricette_data}
-
-        articoli_data = []
-        page = 0
-        while True:
-            res = supabase.table("articoli").select(
-                "id, nome_articolo, prezzo_vendita_netto, prezzo_acquisto_netto"
-            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            articoli_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
         articoli_map = {a["id"]: a for a in articoli_data}
 
         # --- 3. Aggregazione per prodotto (chiave = tipo+id, non il nome: due
         # prodotti diversi potrebbero chiamarsi allo stesso modo) ---
         prodotti_dict = {}
-        for v in vendite_data:
-            qta = v.get("quantita", 0) or 0
-            id_ricetta = v.get("id_ricetta")
-            id_prodotto = v.get("id_prodotto_commerciale")
+        for r in righe_aggregate:
+            qta = r.get("quantita") or 0
+            id_ricetta = r.get("id_ricetta")
+            id_prodotto = r.get("id_prodotto_commerciale")
             ricetta = ricette_map.get(id_ricetta) if id_ricetta is not None else None
             articolo = articoli_map.get(id_prodotto) if id_prodotto is not None else None
 
-            listino_netto = 0.0
             if ricetta:
                 chiave = f"ricetta-{id_ricetta}"
-                listino_netto = ricetta.get("prezzo_vendita_netto", 0) or 0
-                fc_u = ricetta.get("costo_ricetta_reale", 0) or 0
                 nome = ricetta.get("nome_ricetta", "N/D")
                 tipo = "ricetta"
             elif articolo:
                 chiave = f"articolo-{id_prodotto}"
-                listino_netto = articolo.get("prezzo_vendita_netto", 0) or 0
-                fc_u = articolo.get("prezzo_acquisto_netto", 0) or 0
                 nome = articolo.get("nome_articolo", "N/D")
                 tipo = "articolo"
             else:
-                continue  # vendita sospesa/non risolta: non associabile a un prodotto
-
-            # Ricavo REALMENTE applicato alla vendita: prima il totale salvato,
-            # poi l'unitario salvato, infine il listino attuale come ultima
-            # spiaggia (solo per vendite non ancora "backfillate").
-            if v.get("prezzo_totale") is not None:
-                ricavo_tot = v["prezzo_totale"]
-            elif v.get("prezzo_singolo") is not None:
-                ricavo_tot = v["prezzo_singolo"] * qta
-            else:
-                ricavo_tot = listino_netto * qta
+                continue  # vendita non associabile a un prodotto del catalogo
 
             if chiave not in prodotti_dict:
                 prodotti_dict[chiave] = {"id": chiave, "nome": nome, "tipo": tipo, "ricavi": 0.0, "food_cost": 0.0, "qta": 0.0}
-            prodotti_dict[chiave]["ricavi"] += ricavo_tot
-            prodotti_dict[chiave]["food_cost"] += fc_u * qta
+            prodotti_dict[chiave]["ricavi"] += r.get("ricavo_netto") or 0.0
+            prodotti_dict[chiave]["food_cost"] += r.get("food_cost") or 0.0
             prodotti_dict[chiave]["qta"] += qta
 
         # --- 4. Output ---

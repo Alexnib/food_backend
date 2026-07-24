@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, status, Depends
-from models.management import CreateNegozio, CreateSede
+from models.management import CreateNegozio, CreateSede, UpdateMiaSede
 from database.config import Database
 from uuid import UUID
-from utils.auth_utils import get_current_user
+from utils.auth_utils import get_current_user, get_user_sede
 
 router = APIRouter(
     prefix="/api/admin",
@@ -49,3 +49,40 @@ def lista_sedi(id_negozio: UUID, current_user = Depends(get_current_user)):
         return res.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sedi/me")
+def get_mia_sede(auth_data=Depends(get_user_sede)):
+    """La sede (e il negozio associato) dell'utente corrente, per precompilare
+    il form di modifica nel profilo."""
+    res = supabase.table("sedi").select("*, negozi(*)").eq("id", auth_data["id_sede"]).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Sede non trovata.")
+    return res.data[0]
+
+
+@router.put("/sedi/me")
+def update_mia_sede(data: UpdateMiaSede, auth_data=Depends(get_user_sede)):
+    """
+    Modifica i dati della propria sede/negozio (quelli impostati in
+    onboarding): mai un id arbitrario dal client, sempre e solo la sede
+    dell'utente che chiama.
+    """
+    sede_fields = {k: v for k, v in {
+        "indirizzo": data.indirizzo, "comune": data.comune, "civico": data.civico,
+    }.items() if v is not None}
+    negozio_fields = {k: v for k, v in {
+        "nome_negozio": data.nome_negozio, "partita_iva": data.partita_iva,
+    }.items() if v is not None}
+
+    if sede_fields:
+        supabase.table("sedi").update(sede_fields).eq("id", auth_data["id_sede"]).execute()
+
+    if negozio_fields:
+        sede_row = supabase.table("sedi").select("id_negozio").eq("id", auth_data["id_sede"]).execute()
+        id_negozio = sede_row.data[0].get("id_negozio") if sede_row.data else None
+        if id_negozio:
+            supabase.table("negozi").update(negozio_fields).eq("id", id_negozio).execute()
+
+    res = supabase.table("sedi").select("*, negozi(*)").eq("id", auth_data["id_sede"]).execute()
+    return res.data[0] if res.data else None

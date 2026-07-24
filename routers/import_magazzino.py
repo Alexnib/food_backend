@@ -1,7 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
 from database.config import Database
 from utils.auth_utils import get_user_sede
-from utils.ai_parser import parse_excel_with_ai
+from utils.ai_parser import parse_excel_with_ai, parse_fattura_with_ai
 from typing import List, Optional
 import json
 import datetime
@@ -13,19 +13,39 @@ supabase = Database.get_client()
 @router.post("/upload")
 async def upload_excel_for_import(file: UploadFile = File(...), auth_data = Depends(get_user_sede)):
     id_sede = auth_data["id_sede"]
-    
+
     # 1. Ottieni le categorie
     cat_res = supabase.table("categoria_prodotti").select("*").eq("id_sede", id_sede).execute()
     categorie = cat_res.data or []
-    
+
     # 2. Leggi il file
     content = await file.read()
-    
+
     # 3. Manda a Gemini
     try:
         json_str = parse_excel_with_ai(content, file.filename, categorie)
         data = json.loads(json_str)
         return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/upload-fattura")
+async def upload_fattura_for_import(files: List[UploadFile] = File(...), auth_data = Depends(get_user_sede)):
+    """
+    Estrae fornitore, partita IVA e le righe prodotto da una o più fatture di
+    acquisto (PDF o foto). A differenza di /upload (Excel), qui l'utente
+    sceglie sempre a mano tipo/categoria nella schermata di conferma: vedi
+    utils.ai_parser.parse_fattura_with_ai per il perché.
+    """
+    file_parts = []
+    for f in files:
+        content = await f.read()
+        mime_type = f.content_type or "application/pdf"
+        file_parts.append((content, mime_type))
+
+    try:
+        json_str = parse_fattura_with_ai(file_parts)
+        return json.loads(json_str)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -49,6 +69,10 @@ def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_u
         # Trova id_iva
         id_iva = next((i["id"] for i in iva_list if i["iva"] == item.iva_perc), iva_list[0]["id"] if iva_list else None)
         
+        # Fornitore estratto dalla fattura, se presente (l'import da Excel non
+        # lo fornisce mai: resta "Sconosciuto" come già in precedenza).
+        fornitore = item.fornitore or "Sconosciuto"
+
         if item.tipo == "Materia Prima":
             articoli_to_insert.append({
                 "id_sede": id_sede,
@@ -57,7 +81,7 @@ def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_u
                 "prezzo_acquisto_netto": item.costo_netto,
                 "prezzo_acquisto_lordo": item.costo_lordo,
                 "id_iva_acquisto": id_iva,
-                "fornitore": "Sconosciuto",
+                "fornitore": fornitore,
                 "anno": anno_corrente,
                 "is_materia_prima": True,
                 "is_rivendita": False
@@ -78,7 +102,7 @@ def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_u
                 "id_categoria_prodotto": item.id_categoria,
                 "is_materia_prima": True,
                 "is_rivendita": True,
-                "fornitore": "Sconosciuto",
+                "fornitore": fornitore,
                 "anno": anno_corrente
             })
         elif item.tipo == "Rivendita":
@@ -96,7 +120,9 @@ def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_u
                 "id_iva_rivendita": id_iva,
                 "id_categoria_prodotto": item.id_categoria,
                 "is_materia_prima": False,
-                "is_rivendita": True
+                "is_rivendita": True,
+                "fornitore": fornitore,
+                "anno": anno_corrente
             })
         elif item.tipo == "Costo":
             costi_to_insert.append({

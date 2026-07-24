@@ -53,6 +53,9 @@ class ImportedProduct(BaseModel):
     iva_perc: int = Field(description="La percentuale di IVA (es. 4, 10, 22 o 0)")
     costo_lordo: float = Field(description="Il costo comprensivo di IVA (float)")
     id_categoria: Optional[int] = Field(None, description="L'ID della categoria più adatta tra quelle fornite")
+    # Valorizzato solo dall'import da fattura PDF (il fornitore di testata
+    # del documento): l'import da Excel non lo estrae, resta None.
+    fornitore: Optional[str] = Field(None, description="Il fornitore/ragione sociale che ha emesso il documento, se individuabile")
 
 class ParsedResult(BaseModel):
     prodotti: List[ImportedProduct]
@@ -65,6 +68,19 @@ class ImportItem(BaseModel):
     iva_perc: int
     costo_lordo: float
     id_categoria: Optional[Union[int, str]] = None
+    fornitore: Optional[str] = None
 
 class SaveImportRequest(BaseModel):
     prodotti: List[ImportItem]
+
+class FatturaProdotto(BaseModel):
+    nome_prodotto: str = Field(description="Nome del prodotto/articolo acquistato, così come scritto in fattura")
+    unita_misura: str = Field(description="Unità di misura, es. kg, lt, pz, gr — dedotta dal contesto se non esplicita")
+    prezzo_acquisto_netto: Optional[float] = Field(None, description="Prezzo unitario NETTO (imponibile, IVA esclusa) di acquisto")
+    prezzo_acquisto_lordo: Optional[float] = Field(None, description="Prezzo unitario LORDO (IVA inclusa) di acquisto")
+    iva_percentuale: Optional[float] = Field(None, description="Aliquota IVA applicata a questa riga, es. 4, 10, 22")
+
+class FatturaParseResult(BaseModel):
+    fornitore: Optional[str] = Field(None, description="Nome/ragione sociale del fornitore in fattura")
+    partita_iva: Optional[str] = Field(None, description="Partita IVA del fornitore, se presente")
+    prodotti: List[FatturaProdotto]

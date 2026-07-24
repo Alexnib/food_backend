@@ -6,6 +6,7 @@ from fastapi.responses import RedirectResponse
 from supabase import create_client
 from database.config import Database
 import os
+import time
 import logging
 
 router = APIRouter(
@@ -44,8 +45,21 @@ def register(user: UserRegister):
         if not auth_res.user:
             raise HTTPException(status_code=400, detail="Errore durante la registrazione.")
 
+        # Ogni nuovo utente nasce bloccato: resta in attesa che un admin lo
+        # sblocchi dalla sezione Admin, anche dopo aver confermato l'email.
+        # La riga in public.users viene creata da un trigger sull'insert in
+        # auth.users, nella stessa transazione di sign_up(): dovrebbe già
+        # esistere, ma un breve retry rende l'operazione robusta a eventuali
+        # ritardi di propagazione senza far fallire la registrazione stessa.
+        block_res = supabase.table("users").update({"is_blocked": True}).eq("id", auth_res.user.id).execute()
+        if not block_res.data:
+            time.sleep(0.5)
+            block_res = supabase.table("users").update({"is_blocked": True}).eq("id", auth_res.user.id).execute()
+        if not block_res.data:
+            logging.error(f"Impossibile impostare is_blocked per il nuovo utente {auth_res.user.id}")
+
         return {
-            "message": "Utente registrato con successo", 
+            "message": "Utente registrato con successo",
             "user_id": auth_res.user.id
         }
     except HTTPException as he:
@@ -74,7 +88,21 @@ def login(credentials: UserLogin):
 
         if not user_data:
             raise HTTPException(status_code=404, detail="Profilo utente non trovato nel database")
-        
+
+        if user_data.get("is_blocked"):
+            # L'autenticazione è riuscita, ma l'utente non è ancora stato
+            # approvato da un admin: revochiamo comunque la sessione appena
+            # creata, così il token emesso non resta valido inutilizzato.
+            try:
+                admin_client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+                admin_client.auth.admin.sign_out(auth_res.session.access_token, "global")
+            except Exception as e:
+                logging.warning(f"Impossibile revocare la sessione dell'utente bloccato {auth_res.user.id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Il tuo account è in attesa di approvazione da parte di un amministratore."
+            )
+
         logging.info(f"Recupero profilo per {credentials.email}: {'Success' if user_info.data else 'No data'}")
 
         if user_data.get("id_sede"):
@@ -89,10 +117,12 @@ def login(credentials: UserLogin):
             "refresh_token": auth_res.session.refresh_token,
             "user": user_data
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Errore DB durante il recupero del profilo di {auth_res.user.id}: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Errore interno nel recupero del profilo utente"
         )
         
@@ -225,16 +255,6 @@ def update_profile(data: UpdateUser, current_user = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Errore aggiornamento profilo: {str(e)}")
 
-@router.delete("/me")
-def delete_account(current_user = Depends(get_current_user)):
-    try:
-        # 🪄 CLIENT ISOLATO: Creiamo un client usa-e-getta con pieni poteri
-        admin_client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-        # Eseguiamo le eliminazioni usando l'admin_client invece del client globale
-        admin_client.table("users").delete().eq("id", current_user.id).execute()
-        admin_client.auth.admin.delete_user(current_user.id)
-
-        return {"message": "Account eliminato definitivamente."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore durante l'eliminazione dell'account: {str(e)}")
+# Nessuna auto-cancellazione: un utente non può eliminare il proprio account.
+# Solo il blocco/sblocco da parte di un admin (vedi /api/admin/users/{id}/blocco).
