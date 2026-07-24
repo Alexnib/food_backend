@@ -81,50 +81,6 @@ def _scorpora_iva(prezzo_lordo, iva_perc):
     return round(prezzo_lordo / (1 + iva_perc / 100), 2)
 
 
-def _get_listino_lordo_netto_batch(ids_ricette, ids_commerciali):
-    """Prezzo di vendita netto E lordo ATTUALI dal listino, per prodotto —
-    usato per verificare/correggere la stima di prezzo_lordo dell'AI (vedi
-    _correggi_prezzo_lordo): a differenza di _get_listino_prices_batch, qui
-    serve anche il lordo, non solo il netto."""
-    listino_ricette = {}
-    if ids_ricette:
-        res = supabase.table("ricette").select("id, prezzo_vendita_netto, prezzo_vendita_lordo").in_("id", list(set(ids_ricette))).execute()
-        listino_ricette = {r["id"]: (r.get("prezzo_vendita_netto"), r.get("prezzo_vendita_lordo")) for r in (res.data or [])}
-    listino_articoli = {}
-    if ids_commerciali:
-        res = supabase.table("articoli").select("id, prezzo_vendita_netto, prezzo_vendita_lordo").in_("id", list(set(ids_commerciali))).execute()
-        listino_articoli = {a["id"]: (a.get("prezzo_vendita_netto"), a.get("prezzo_vendita_lordo")) for a in (res.data or [])}
-    return listino_ricette, listino_articoli
-
-
-def _correggi_prezzo_lordo(prezzo_grezzo, listino_netto, listino_lordo, ipotesi_ai):
-    """
-    L'AI stima se una colonna di prezzi è netta o lorda guardando se le cifre
-    sono "tonde" — un'euristica che si rivela SBAGLIATA per i listini dove
-    (come tipicamente in un locale) il prezzo tondo è quello mostrato al
-    cliente (lordo, IVA inclusa) e il netto è il decimale scorporato: in quel
-    caso l'AI scambia sistematicamente lordo per netto (visto in produzione:
-    un intero mese di vendite salvato con l'IVA raddoppiata di fatto).
-
-    Qui abbiamo un'informazione che l'AI non ha: il prodotto è già stato
-    abbinato a una riga di catalogo, quindi conosciamo il suo VERO prezzo
-    netto e lordo attuali. Se il prezzo grezzo estratto combacia chiaramente
-    con uno dei due (e non con l'altro), quella è un'evidenza più affidabile
-    della sola valutazione visiva dell'AI e la sostituisce. Se è ambiguo o
-    non c'è un match netto, ci fidiamo della stima dell'AI (invariata).
-    """
-    if prezzo_grezzo is None:
-        return ipotesi_ai
-    TOLLERANZA = 0.03
-    vicino_netto = listino_netto is not None and abs(prezzo_grezzo - listino_netto) < TOLLERANZA
-    vicino_lordo = listino_lordo is not None and abs(prezzo_grezzo - listino_lordo) < TOLLERANZA
-    if vicino_lordo and not vicino_netto:
-        return True
-    if vicino_netto and not vicino_lordo:
-        return False
-    return ipotesi_ai
-
-
 def _get_costi_lordi_batch(ids_ricette, ids_commerciali):
     """Per un insieme di ricette/articoli, food cost unitario e aliquota IVA
     di vendita ATTUALI — le materie prime per congelare lordo e food cost su
@@ -251,27 +207,15 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                 "item": item,
                 "data_vendita_iso": data_vendita_iso,
                 "prezzo_singolo": prezzo_singolo_item,
+                # Totale di riga così come scritto nel file, PRIMA di derivarlo
+                # dal prezzo unitario: preservato per non perdere precisione
+                # quando quantità non divide esattamente il totale (es. 39€ per
+                # 35 unità -> unitario 1,11 che moltiplicato per 35 non ritorna
+                # a 39 esatti). Vedi uso in 1c.
+                "prezzo_totale_raw": round2(item.prezzo_totale) if item.prezzo_totale is not None else None,
                 "id_ricetta": id_ricetta,
                 "id_commerciale": id_commerciale,
             })
-
-        # 1a-bis. Verifica/correzione della stima "prezzo_lordo" dell'AI
-        # contro il listino REALE del prodotto già abbinato (vedi
-        # _correggi_prezzo_lordo) — per tutte le righe con un prezzo e un
-        # prodotto riconosciuto, non solo quelle che l'AI ha segnato come
-        # lorde: serve a correggere anche il caso opposto (l'AI ha detto
-        # "netto" ma il prezzo è in realtà quello lordo di listino).
-        ids_ricette_listino = {p["id_ricetta"] for p in pending if p["id_ricetta"]}
-        ids_commerciali_listino = {p["id_commerciale"] for p in pending if p["id_commerciale"]}
-        listino_ricette, listino_articoli = _get_listino_lordo_netto_batch(list(ids_ricette_listino), list(ids_commerciali_listino))
-
-        for p in pending:
-            netto_l, lordo_l = (
-                listino_ricette.get(p["id_ricetta"]) if p["id_ricetta"]
-                else listino_articoli.get(p["id_commerciale"]) if p["id_commerciale"]
-                else (None, None)
-            ) or (None, None)
-            p["prezzo_lordo_corretto"] = _correggi_prezzo_lordo(p["prezzo_singolo"], netto_l, lordo_l, p["item"].prezzo_lordo)
 
         # 1b. Per le righe marcate come LORDE (scontrino/comanda, o excel con
         # prezzi riconosciuti come tali) e senza un'aliquota già nota dal
@@ -279,12 +223,12 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
         # prodotto associato, per poterle scorporare in netto.
         ids_ricette_iva = {
             p["id_ricetta"] for p in pending
-            if p["prezzo_lordo_corretto"] and p["prezzo_singolo"] is not None
+            if p["item"].prezzo_lordo and p["prezzo_singolo"] is not None
             and p["item"].iva_percentuale is None and p["id_ricetta"]
         }
         ids_commerciali_iva = {
             p["id_commerciale"] for p in pending
-            if p["prezzo_lordo_corretto"] and p["prezzo_singolo"] is not None
+            if p["item"].prezzo_lordo and p["prezzo_singolo"] is not None
             and p["item"].iva_percentuale is None and p["id_commerciale"]
         }
         iva_ricette, iva_articoli = _get_iva_rates_batch(list(ids_ricette_iva), list(ids_commerciali_iva))
@@ -298,11 +242,31 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
             id_ricetta = p["id_ricetta"]
             id_commerciale = p["id_commerciale"]
             prezzo_singolo_item = p["prezzo_singolo"]
+            prezzo_totale_raw = p["prezzo_totale_raw"]
 
-            if p["prezzo_lordo_corretto"] and prezzo_singolo_item is not None:
+            iva_perc = None
+            if item.prezzo_lordo and (prezzo_singolo_item is not None or prezzo_totale_raw is not None):
                 iva_perc = item.iva_percentuale
                 if iva_perc is None:
                     iva_perc = iva_ricette.get(id_ricetta) if id_ricetta else iva_articoli.get(id_commerciale)
+
+            # Totale ESATTO di questa riga (netto e lordo), quando il file dava
+            # un totale esplicito: deriva direttamente da quello, non da
+            # unitario*quantità, per non perdere i centesimi di cui sopra. Se
+            # il file dava solo un prezzo unitario (nessun totale proprio),
+            # resta None: il totale del gruppo si baserà su unitario*quantità
+            # come sempre.
+            totale_netto_riga = None
+            totale_lordo_riga = None
+            if prezzo_totale_raw is not None:
+                if item.prezzo_lordo:
+                    totale_lordo_riga = prezzo_totale_raw
+                    totale_netto_riga = _scorpora_iva(prezzo_totale_raw, iva_perc) if iva_perc is not None else None
+                else:
+                    totale_netto_riga = prezzo_totale_raw
+                    totale_lordo_riga = round(prezzo_totale_raw * (1 + iva_perc / 100), 2) if iva_perc is not None else None
+
+            if item.prezzo_lordo and prezzo_singolo_item is not None:
                 prezzo_singolo_item = _scorpora_iva(prezzo_singolo_item, iva_perc)
 
             if item.id_tipo not in ("finito", "commerciale"):
@@ -312,7 +276,7 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                     "id_sede": auth_data["id_sede"],
                     "nome_vendita": item.nome_vendita or "Sconosciuto",
                     "prezzo_singolo": prezzo_singolo_item,
-                    "prezzo_totale": round(prezzo_singolo_item * item.quantita, 2) if prezzo_singolo_item is not None else None,
+                    "prezzo_totale": totale_netto_riga if totale_netto_riga is not None else (round(prezzo_singolo_item * item.quantita, 2) if prezzo_singolo_item is not None else None),
                 })
                 continue
 
@@ -321,9 +285,24 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                 # Il prezzo è già parte della chiave, quindi arriviamo qui solo
                 # se questa riga condivide lo stesso prezzo (o la stessa assenza
                 # di prezzo) del gruppo: sommare la quantità è sempre corretto.
-                valid_vendite_grouped[key]["quantita"] += item.quantita
+                g = valid_vendite_grouped[key]
+                g["quantita"] += item.quantita
+                if g["totale_netto_esatto"] is not None and totale_netto_riga is not None:
+                    g["totale_netto_esatto"] += totale_netto_riga
+                    g["totale_lordo_esatto"] += totale_lordo_riga
+                else:
+                    # Anche una sola riga del gruppo senza totale esatto proprio
+                    # (solo prezzo unitario) fa perdere la precisione a tutto il
+                    # gruppo: si ricade su unitario*quantità come prima.
+                    g["totale_netto_esatto"] = None
+                    g["totale_lordo_esatto"] = None
             else:
-                valid_vendite_grouped[key] = {"quantita": item.quantita, "prezzo_singolo": prezzo_singolo_item}
+                valid_vendite_grouped[key] = {
+                    "quantita": item.quantita,
+                    "prezzo_singolo": prezzo_singolo_item,
+                    "totale_netto_esatto": totale_netto_riga,
+                    "totale_lordo_esatto": totale_lordo_riga,
+                }
 
         results = []
 
@@ -359,7 +338,13 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
             # un prezzo diverso già registrato.
             existing_sales_dict = {}
             for sale in existing_sales:
-                key = (sale["data_vendita"], sale.get("id_ricetta"), sale.get("id_prodotto_commerciale"), _price_bucket(sale.get("prezzo_singolo")))
+                # sale["data_vendita"] arriva da Postgres come timestamp completo
+                # ("2026-07-23T00:00:00+00:00"), mentre data_vendita_iso sopra è
+                # una bara data ("2026-07-23"): senza troncare i primi 10
+                # caratteri le chiavi non combaciano MAI, e un nuovo import
+                # crea sempre una riga duplicata invece di agganciarsi a quella
+                # esistente (bug preesistente, non legato al prezzo).
+                key = (sale["data_vendita"][:10], sale.get("id_ricetta"), sale.get("id_prodotto_commerciale"), _price_bucket(sale.get("prezzo_singolo")))
                 existing_sales_dict[key] = sale
 
             # Per i gruppi ancora senza prezzo (nessuna riga sorgente lo portava), lo
@@ -403,6 +388,21 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                         fc_unitario = fc_unitario if fc_unitario is not None else fresh["food_cost_unitario"]
                         pl_unitario = pl_unitario if pl_unitario is not None else fresh["prezzo_singolo_lordo"]
 
+                    # Totale netto/lordo: se sia la riga già salvata sia il
+                    # nuovo gruppo hanno un totale ESATTO (non ricostruito da
+                    # unitario*quantità), li sommiamo direttamente — preserva i
+                    # centesimi reali di entrambi i lati invece di perderli
+                    # nel passaggio per il prezzo unitario arrotondato.
+                    if group["totale_netto_esatto"] is not None and sale.get("prezzo_totale") is not None:
+                        prezzo_totale_finale = round(sale["prezzo_totale"] + group["totale_netto_esatto"], 2)
+                    else:
+                        prezzo_totale_finale = round(new_quantita * prezzo_singolo, 2) if prezzo_singolo is not None else None
+
+                    if group["totale_lordo_esatto"] is not None and sale.get("prezzo_totale_lordo") is not None:
+                        prezzo_totale_lordo_finale = round(sale["prezzo_totale_lordo"] + group["totale_lordo_esatto"], 2)
+                    else:
+                        prezzo_totale_lordo_finale = round(pl_unitario * new_quantita, 2) if pl_unitario is not None else None
+
                     vendite_to_upsert.append({
                         "id": sale["id"],
                         "data_vendita": data_vendita,
@@ -411,15 +411,21 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                         "id_ricetta": id_ricetta,
                         "id_prodotto_commerciale": id_commerciale,
                         "prezzo_singolo": prezzo_singolo,
-                        "prezzo_totale": round(new_quantita * prezzo_singolo, 2) if prezzo_singolo is not None else None,
+                        "prezzo_totale": prezzo_totale_finale,
                         "food_cost_unitario": fc_unitario,
                         "food_cost_totale": round(fc_unitario * new_quantita, 2) if fc_unitario is not None else None,
                         "prezzo_singolo_lordo": pl_unitario,
-                        "prezzo_totale_lordo": round(pl_unitario * new_quantita, 2) if pl_unitario is not None else None,
+                        "prezzo_totale_lordo": prezzo_totale_lordo_finale,
                     })
                 else:
                     prezzo_singolo = round2(group["prezzo_singolo"])
                     snap = _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, quantita_da_aggiungere, costi_lordi_batch)
+                    # Idem: usa il totale esatto del gruppo quando disponibile,
+                    # invece di quello ricostruito da _snapshot_riga da
+                    # unitario*quantità.
+                    prezzo_totale_finale = group["totale_netto_esatto"] if group["totale_netto_esatto"] is not None else (round(quantita_da_aggiungere * prezzo_singolo, 2) if prezzo_singolo is not None else None)
+                    if group["totale_lordo_esatto"] is not None:
+                        snap["prezzo_totale_lordo"] = group["totale_lordo_esatto"]
                     vendite_to_upsert.append({
                         "data_vendita": data_vendita,
                         "quantita": quantita_da_aggiungere,
@@ -427,7 +433,7 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                         "id_ricetta": id_ricetta,
                         "id_prodotto_commerciale": id_commerciale,
                         "prezzo_singolo": prezzo_singolo,
-                        "prezzo_totale": round(quantita_da_aggiungere * prezzo_singolo, 2) if prezzo_singolo is not None else None,
+                        "prezzo_totale": prezzo_totale_finale,
                         **snap,
                     })
 
