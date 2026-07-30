@@ -503,6 +503,14 @@ def get_food_cost_analytics(
         # altrimenti fallback equivalente — più anagrafiche di ricette (con
         # albero ingredienti, per il breakdown), articoli e categorie. ---
         def _ricette_tree():
+            # Percorso veloce: get_ricette_con_ingredienti (sql/010) fa il join
+            # con gli ingredienti dentro Postgres, evitando il resource embedding
+            # di PostgREST (lo stesso tipo già mostratosi inaffidabile altrove,
+            # vedi database/config.py). Fallback identico se non ancora creata.
+            rows = call_rpc_or_none("get_ricette_con_ingredienti", {"p_id_sede": id_sede}, order_cols=["id"])
+            if rows is not None:
+                return rows
+
             def make_query(with_count):
                 return supabase.table("ricette").select(
                     "id, nome_ricetta, prezzo_vendita_netto, costo_ricetta_reale, id_categoria_prodotto, "
@@ -716,24 +724,28 @@ def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
     try:
         id_sede = auth_data["id_sede"]
 
-        # Recupera tutte le ricette con ingredienti in cascata (paginato per
-        # sicurezza, stesso pattern usato altrove per evitare il limite di
-        # default di Supabase sulle righe restituite)
-        pf_data = []
-        page = 0
-        page_size = 500
-        while True:
-            res = supabase.table("ricette").select(
-                "id, nome_ricetta, prezzo_vendita_netto, prezzo_vendita_lordo, costo_ricetta_reale, "
-                "ingredienti_ricetta(quantita_per_kg, perc_scarto, "
-                "articoli(nome_articolo, prezzo_acquisto_netto, unita_misura))"
-            ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
-            if not res.data:
-                break
-            pf_data.extend(res.data)
-            if len(res.data) < page_size:
-                break
-            page += 1
+        # Percorso veloce: get_ricette_con_ingredienti (sql/010) fa il join con
+        # gli ingredienti dentro Postgres, evitando il resource embedding di
+        # PostgREST (lo stesso tipo già mostratosi inaffidabile altrove, vedi
+        # database/config.py). Fallback identico (stesso pattern di
+        # paginazione usato altrove) se non ancora creata.
+        pf_data = call_rpc_or_none("get_ricette_con_ingredienti", {"p_id_sede": id_sede}, order_cols=["id"])
+        if pf_data is None:
+            pf_data = []
+            page = 0
+            page_size = 500
+            while True:
+                res = supabase.table("ricette").select(
+                    "id, nome_ricetta, prezzo_vendita_netto, prezzo_vendita_lordo, costo_ricetta_reale, "
+                    "ingredienti_ricetta(quantita_per_kg, perc_scarto, "
+                    "articoli(nome_articolo, prezzo_acquisto_netto, unita_misura))"
+                ).eq("id_sede", id_sede).range(page * page_size, (page + 1) * page_size - 1).execute()
+                if not res.data:
+                    break
+                pf_data.extend(res.data)
+                if len(res.data) < page_size:
+                    break
+                page += 1
 
         result = []
 

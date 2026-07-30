@@ -61,9 +61,24 @@ def ricalcola_costo_ricette(id_ricetta_list: list) -> None:
     questa funzione, cambiare il prezzo di acquisto di una materia prima (in
     routers/magazzino.py) non si riflette mai sul food cost delle ricette che la
     usano, finché qualcuno non ri-salva manualmente ciascuna ricetta.
+
+    Percorso veloce: la funzione SQL recalc_costo_ricette (sql/009) fa join,
+    calcolo e UPDATE per TUTTE le ricette in un'unica query dentro Postgres,
+    invece di 1 lettura (con join annidato via PostgREST — lo stesso tipo già
+    mostratosi inaffidabile altrove, vedi database/config.py) + una scrittura
+    separata per ogni ricetta. Se la funzione non è ancora stata creata sul
+    database, ricade sul fallback Python sotto, che fa lo stesso identico
+    calcolo (stessa formula di _costo_ingrediente): nessuna differenza di
+    risultato, solo di velocità/affidabilità.
     """
     if not id_ricetta_list:
         return
+
+    try:
+        supabase.rpc("recalc_costo_ricette", {"p_id_ricetta_list": id_ricetta_list}).execute()
+        return
+    except Exception:
+        pass  # Funzione non ancora creata (o problema transitorio): fallback sotto.
 
     ricette_res = supabase.table("ricette").select(
         "id, ingredienti_ricetta(quantita_per_kg, perc_scarto, articoli(prezzo_acquisto_netto))"

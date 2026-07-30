@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from utils.auth_utils import get_current_user, get_user_role, ADMIN_ROLE_ID, USER_ROLE_ID
+from utils.db_fetch import call_rpc_or_none
 from database.config import Database
 from models.chat import ChatStatoUpdate
 from routers.chat import _map_chat
@@ -29,7 +30,17 @@ def list_users(_: object = Depends(require_admin)):
     Elenca tutte le utenze "user" (role 2) con la sede assegnata, per la
     sezione admin da cui scegliere quale utente visualizzare e approvare
     (sbloccare) le nuove registrazioni.
+
+    Percorso veloce: get_admin_users_list (sql/011) fa il join con sedi/negozi
+    dentro Postgres, evitando il resource embedding di PostgREST (lo stesso
+    tipo già mostratosi inaffidabile altrove, vedi database/config.py — ed è
+    il sintomo osservato qui: lista utenti a volte vuota o incompleta finché
+    non passano un paio di minuti). Fallback identico se non ancora creata.
     """
+    rows = call_rpc_or_none("get_admin_users_list", {"p_role_id": USER_ROLE_ID}, order_cols=["id"])
+    if rows is not None:
+        return rows
+
     res = supabase.table("users").select(
         "id, nome, cognome, email, telefono, is_blocked, is_verified, id_sede, "
         "sedi(comune, indirizzo, negozi(nome_negozio))"

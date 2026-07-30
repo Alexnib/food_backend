@@ -7,9 +7,12 @@ from utils.db_fetch import call_rpc_or_none, run_parallel, fetch_all_parallel
 from fastapi.responses import StreamingResponse
 import io
 import time
+import logging
 import pandas as pd
 from datetime import date
 from openpyxl.styles import Font
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/vendite", tags=["Vendite"])
 supabase = Database.get_client()
@@ -244,6 +247,33 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
             prezzo_singolo_item = p["prezzo_singolo"]
             prezzo_totale_raw = p["prezzo_totale_raw"]
 
+            # Una vendita sospesa non ha (ancora) un prodotto associato, quindi
+            # nessuna aliquota IVA nota con cui scorporare un netto attendibile
+            # — prima si tentava comunque lo scorporo (quasi sempre con
+            # iva_perc None, dato che id_ricetta/id_commerciale sono sempre
+            # None qui), e nel fallback si ricostruiva il totale come
+            # unitario*quantità invece di preservare il totale ESATTO letto
+            # dalla fonte, perdendo precisione ogni volta che il file dava un
+            # totale diretto invece che solo un prezzo unitario. Si salva
+            # sempre il valore così com'è dalla fonte (lordo, per scanner/
+            # import Excel vendite: prezzo_lordo è sempre true lì) — lo
+            # scorporo avviene solo più avanti, quando l'utente risolve la
+            # sospesa assegnandole un prodotto reale con aliquota nota.
+            if item.id_tipo not in ("finito", "commerciale"):
+                prezzo_singolo_sospeso = prezzo_singolo_item
+                prezzo_totale_sospeso = prezzo_totale_raw if prezzo_totale_raw is not None else (
+                    round(prezzo_singolo_sospeso * item.quantita, 2) if prezzo_singolo_sospeso is not None else None
+                )
+                vendite_sospese_to_insert.append({
+                    "data_vendita": data_vendita_iso,
+                    "quantita": item.quantita,
+                    "id_sede": auth_data["id_sede"],
+                    "nome_vendita": item.nome_vendita or "Sconosciuto",
+                    "prezzo_singolo": prezzo_singolo_sospeso,
+                    "prezzo_totale": prezzo_totale_sospeso,
+                })
+                continue
+
             iva_perc = None
             if item.prezzo_lordo and (prezzo_singolo_item is not None or prezzo_totale_raw is not None):
                 iva_perc = item.iva_percentuale
@@ -268,17 +298,6 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
 
             if item.prezzo_lordo and prezzo_singolo_item is not None:
                 prezzo_singolo_item = _scorpora_iva(prezzo_singolo_item, iva_perc)
-
-            if item.id_tipo not in ("finito", "commerciale"):
-                vendite_sospese_to_insert.append({
-                    "data_vendita": data_vendita_iso,
-                    "quantita": item.quantita,
-                    "id_sede": auth_data["id_sede"],
-                    "nome_vendita": item.nome_vendita or "Sconosciuto",
-                    "prezzo_singolo": prezzo_singolo_item,
-                    "prezzo_totale": totale_netto_riga if totale_netto_riga is not None else (round(prezzo_singolo_item * item.quantita, 2) if prezzo_singolo_item is not None else None),
-                })
-                continue
 
             key = (data_vendita_iso, id_ricetta, id_commerciale, _price_bucket(prezzo_singolo_item))
             if key in valid_vendite_grouped:
@@ -314,39 +333,20 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
                 res = supabase.table("vendite_sospese").insert(chunk).execute()
                 results.extend(res.data)
 
-        # 3. Gestisci le vendite valide con bulk upsert
+        # 3. Gestisci le vendite valide con upsert ATOMICO via RPC (vedi
+        # sql/013_vendite_bulk_upsert_rpc.sql). La vecchia versione leggeva le
+        # vendite esistenti con una SELECT separata e decideva in Python se
+        # una riga esisteva già PRIMA di scrivere: tra quella lettura e la
+        # scrittura successiva (due chiamate HTTP/transazioni distinte, nessuna
+        # connessione persistente via PostgREST) due richieste concorrenti
+        # sulla stessa chiave (stesso prodotto/giorno/prezzo) potevano
+        # entrambe decidere "nessuna riga esistente" e sovrascriversi a
+        # vicenda, perdendo silenziosamente quantità (lost update). La
+        # funzione SQL fa l'intera sequenza "esiste già? somma o ricalcola?
+        # scrivi" in un'unica transazione per gruppo, con Postgres stesso a
+        # serializzare le scritture concorrenti tramite ON CONFLICT contro un
+        # indice UNIQUE reale — non più il codice Python.
         if valid_vendite_grouped:
-            dates = [k[0] for k in valid_vendite_grouped.keys()]
-            min_date = min(dates)
-            max_date = max(dates)
-
-            existing_sales = []
-            page = 0
-            page_size = 1000
-            while True:
-                res = supabase.table("vendite").select("*").eq("id_sede", auth_data["id_sede"]).gte("data_vendita", min_date).lte("data_vendita", max_date).range(page * page_size, (page + 1) * page_size - 1).execute()
-                if not res.data:
-                    break
-                existing_sales.extend(res.data)
-                if len(res.data) < page_size:
-                    break
-                page += 1
-
-            # Anche le vendite già salvate vengono cercate per (data, prodotto, PREZZO):
-            # così un nuovo import si aggancia a una riga esistente solo se il prezzo
-            # coincide, altrimenti finisce in una riga nuova invece di sovrascrivere
-            # un prezzo diverso già registrato.
-            existing_sales_dict = {}
-            for sale in existing_sales:
-                # sale["data_vendita"] arriva da Postgres come timestamp completo
-                # ("2026-07-23T00:00:00+00:00"), mentre data_vendita_iso sopra è
-                # una bara data ("2026-07-23"): senza troncare i primi 10
-                # caratteri le chiavi non combaciano MAI, e un nuovo import
-                # crea sempre una riga duplicata invece di agganciarsi a quella
-                # esistente (bug preesistente, non legato al prezzo).
-                key = (sale["data_vendita"][:10], sale.get("id_ricetta"), sale.get("id_prodotto_commerciale"), _price_bucket(sale.get("prezzo_singolo")))
-                existing_sales_dict[key] = sale
-
             # Per i gruppi ancora senza prezzo (nessuna riga sorgente lo portava), lo
             # recuperiamo dal listino attuale — in batch, non una query per prodotto.
             ids_ricette_mancanti = {k[1] for k, g in valid_vendite_grouped.items() if g["prezzo_singolo"] is None and k[1]}
@@ -364,90 +364,63 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
             ids_commerciali_snapshot = {k[2] for k in valid_vendite_grouped.keys() if k[2]}
             costi_lordi_batch = _get_costi_lordi_batch(list(ids_ricette_snapshot), list(ids_commerciali_snapshot))
 
-            vendite_to_upsert = []
+            payload_groups = []
             for key, group in valid_vendite_grouped.items():
                 data_vendita, id_ricetta, id_commerciale, _ = key
-                quantita_da_aggiungere = group["quantita"]
-                if key in existing_sales_dict:
-                    # La chiave include già il prezzo, quindi se troviamo una riga
-                    # esistente è garantito che condivida lo stesso prezzo (bucket) di
-                    # questo gruppo: qui teniamo il valore della riga già salvata solo
-                    # per precisione (non arrotondato) o come fallback se fosse null.
-                    sale = existing_sales_dict[key]
-                    new_quantita = sale["quantita"] + quantita_da_aggiungere
-                    prezzo_singolo = round2(sale.get("prezzo_singolo") if sale.get("prezzo_singolo") is not None else group["prezzo_singolo"])
+                prezzo_singolo = round2(group["prezzo_singolo"])
+                # food_cost_unitario e prezzo_singolo_lordo NON dipendono dalla
+                # quantità finale (che si conosce solo dentro la funzione SQL,
+                # dopo aver visto se la riga esiste già): calcolabili sempre
+                # qui, a prescindere che il gruppo finisca per essere un
+                # insert o un update.
+                unit_snap = _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, group["quantita"], costi_lordi_batch)
+                payload_groups.append({
+                    "data_vendita": data_vendita,
+                    "id_ricetta": id_ricetta,
+                    "id_prodotto_commerciale": id_commerciale,
+                    "delta_quantita": group["quantita"],
+                    "prezzo_singolo": prezzo_singolo,
+                    "totale_netto_esatto": group["totale_netto_esatto"],
+                    "totale_lordo_esatto": group["totale_lordo_esatto"],
+                    "food_cost_unitario": unit_snap["food_cost_unitario"],
+                    "prezzo_singolo_lordo": unit_snap["prezzo_singolo_lordo"],
+                })
 
-                    # Stesso principio del prezzo: se la riga esistente ha già uno
-                    # snapshot congelato, lo teniamo (non lo sostituiamo col dato di
-                    # oggi solo perché arriva altra quantità); ricalcoliamo solo i
-                    # totali sulla nuova quantità complessiva.
-                    fc_unitario = sale.get("food_cost_unitario")
-                    pl_unitario = sale.get("prezzo_singolo_lordo")
-                    if fc_unitario is None or pl_unitario is None:
-                        fresh = _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, new_quantita, costi_lordi_batch)
-                        fc_unitario = fc_unitario if fc_unitario is not None else fresh["food_cost_unitario"]
-                        pl_unitario = pl_unitario if pl_unitario is not None else fresh["prezzo_singolo_lordo"]
-
-                    # Totale netto/lordo: se sia la riga già salvata sia il
-                    # nuovo gruppo hanno un totale ESATTO (non ricostruito da
-                    # unitario*quantità), li sommiamo direttamente — preserva i
-                    # centesimi reali di entrambi i lati invece di perderli
-                    # nel passaggio per il prezzo unitario arrotondato.
-                    if group["totale_netto_esatto"] is not None and sale.get("prezzo_totale") is not None:
-                        prezzo_totale_finale = round(sale["prezzo_totale"] + group["totale_netto_esatto"], 2)
-                    else:
-                        prezzo_totale_finale = round(new_quantita * prezzo_singolo, 2) if prezzo_singolo is not None else None
-
-                    if group["totale_lordo_esatto"] is not None and sale.get("prezzo_totale_lordo") is not None:
-                        prezzo_totale_lordo_finale = round(sale["prezzo_totale_lordo"] + group["totale_lordo_esatto"], 2)
-                    else:
-                        prezzo_totale_lordo_finale = round(pl_unitario * new_quantita, 2) if pl_unitario is not None else None
-
-                    vendite_to_upsert.append({
-                        "id": sale["id"],
-                        "data_vendita": data_vendita,
-                        "quantita": new_quantita,
-                        "id_sede": auth_data["id_sede"],
-                        "id_ricetta": id_ricetta,
-                        "id_prodotto_commerciale": id_commerciale,
-                        "prezzo_singolo": prezzo_singolo,
-                        "prezzo_totale": prezzo_totale_finale,
-                        "food_cost_unitario": fc_unitario,
-                        "food_cost_totale": round(fc_unitario * new_quantita, 2) if fc_unitario is not None else None,
-                        "prezzo_singolo_lordo": pl_unitario,
-                        "prezzo_totale_lordo": prezzo_totale_lordo_finale,
-                    })
-                else:
-                    prezzo_singolo = round2(group["prezzo_singolo"])
-                    snap = _snapshot_riga(id_ricetta, id_commerciale, prezzo_singolo, quantita_da_aggiungere, costi_lordi_batch)
-                    # Idem: usa il totale esatto del gruppo quando disponibile,
-                    # invece di quello ricostruito da _snapshot_riga da
-                    # unitario*quantità.
-                    prezzo_totale_finale = group["totale_netto_esatto"] if group["totale_netto_esatto"] is not None else (round(quantita_da_aggiungere * prezzo_singolo, 2) if prezzo_singolo is not None else None)
-                    if group["totale_lordo_esatto"] is not None:
-                        snap["prezzo_totale_lordo"] = group["totale_lordo_esatto"]
-                    vendite_to_upsert.append({
-                        "data_vendita": data_vendita,
-                        "quantita": quantita_da_aggiungere,
-                        "id_sede": auth_data["id_sede"],
-                        "id_ricetta": id_ricetta,
-                        "id_prodotto_commerciale": id_commerciale,
-                        "prezzo_singolo": prezzo_singolo,
-                        "prezzo_totale": prezzo_totale_finale,
-                        **snap,
-                    })
-
-            if vendite_to_upsert:
+            if payload_groups:
                 chunk_size = 500
-                for i in range(0, len(vendite_to_upsert), chunk_size):
-                    chunk = vendite_to_upsert[i:i+chunk_size]
-                    res = supabase.table("vendite").upsert(chunk).execute()
+                for i in range(0, len(payload_groups), chunk_size):
+                    chunk = payload_groups[i:i + chunk_size]
+                    # Niente call_rpc_or_none qui: se la funzione manca ancora
+                    # sul DB (sql/013 non ancora eseguito), l'errore deve
+                    # emergere chiaro tramite l'except sotto — un fallback
+                    # silenzioso ricadrebbe esattamente sul percorso racy che
+                    # questa modifica rimuove.
+                    res = supabase.rpc("upsert_vendite_bulk", {
+                        "p_id_sede": auth_data["id_sede"],
+                        "p_groups": chunk,
+                    }).execute()
                     if res.data:
                         results.extend(res.data)
 
         return {"message": f"{len(results)} voci processate (raggruppate) con successo.", "data": results}
+    except HTTPException:
+        # Già un errore "di validazione" deliberato (es. "Nessun item da
+        # salvare."): passa invariato, non va ricatalogato come 400 generico
+        # né confuso con un bug reale nel ramo sotto.
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Prima di questa modifica QUALSIASI eccezione qui (compreso un vero
+        # bug — AttributeError, KeyError su una risposta inattesa dell'RPC,
+        # ecc.) diventava un 400 col testo grezzo dell'eccezione: indistinguibile,
+        # per l'utente e per un eventuale monitoraggio, da un errore di
+        # validazione. Logghiamo sempre lo stack completo; solo un errore
+        # riconducibile a un problema di dati (RPC mancante, valori non
+        # validi) resta un 400 — il resto è un 500, segnale che c'è un bug da
+        # investigare, non "colpa" di chi ha caricato il file.
+        logger.exception("registra_vendite_bulk: errore inatteso")
+        if isinstance(e, (ValueError, TypeError)) or getattr(e, "code", None) == "PGRST202":
+            raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="Errore interno durante il salvataggio delle vendite. Riprova più tardi.")
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
@@ -526,37 +499,64 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
 # la modifica prezzi in blocco non ha mai funzionato per questo).
 @router.put("/bulk-prezzo")
 def aggiorna_prezzo_bulk(data: VenditaBulkPrezzoUpdate, auth_data = Depends(get_user_sede)):
-    """Applica lo stesso nuovo prezzo unitario a un insieme di vendite già
-    registrate (selezionate dall'utente in /per-prodotto), ricalcolando il
-    totale di riga in base alla quantità già salvata su ciascuna."""
+    """Applica un nuovo prezzo LORDO (IVA inclusa, quello che l'utente
+    conosce/vede davvero) a un insieme di vendite già registrate (selezionate
+    dall'utente in /per-prodotto), in una delle due modalità (vedi
+    VenditaBulkPrezzoUpdate): stesso prezzo UNITARIO per ogni riga (il totale
+    segue dalla quantità di ciascuna) oppure stesso TOTALE per ogni riga (il
+    prezzo unitario si ricava dividendo per la quantità di ciascuna). Il
+    netto si ottiene scorporando l'aliquota IVA ATTUALE del prodotto."""
     if not data.ids:
         return {"message": "Nessuna vendita selezionata."}
 
-    nuovo_prezzo = round2(data.nuovo_prezzo_singolo)
-    if nuovo_prezzo is None or nuovo_prezzo < 0:
+    usa_totale = data.nuovo_totale_lordo is not None
+    valore_lordo = round2(data.nuovo_totale_lordo if usa_totale else data.nuovo_prezzo_singolo_lordo)
+    if valore_lordo is None or valore_lordo < 0:
         raise HTTPException(status_code=400, detail="Prezzo non valido.")
 
     res = supabase.table("vendite").select("id, quantita, id_ricetta, id_prodotto_commerciale").in_("id", data.ids).eq("id_sede", auth_data["id_sede"]).execute()
     righe = res.data or []
 
-    # Il netto cambia: il lordo va ricalcolato sulla nuova base (aliquota IVA
-    # ATTUALE del prodotto), altrimenti resterebbe legato al vecchio prezzo.
-    # Il food cost non dipende dal prezzo di vendita e resta quello già
-    # congelato sulla riga, non lo tocchiamo.
+    # Aliquota IVA ATTUALE per prodotto, per scorporare il lordo appena
+    # inserito in un netto coerente. Il food cost non dipende dal prezzo di
+    # vendita e resta quello già congelato sulla riga, non lo tocchiamo.
     ids_ricette = {r["id_ricetta"] for r in righe if r.get("id_ricetta")}
     ids_commerciali = {r["id_prodotto_commerciale"] for r in righe if r.get("id_prodotto_commerciale")}
-    costi_lordi_batch = _get_costi_lordi_batch(list(ids_ricette), list(ids_commerciali))
+    iva_ricette, iva_articoli = _get_iva_rates_batch(list(ids_ricette), list(ids_commerciali))
 
     aggiornate = 0
     for riga in righe:
-        snap = _snapshot_riga(riga.get("id_ricetta"), riga.get("id_prodotto_commerciale"), nuovo_prezzo, riga["quantita"], costi_lordi_batch)
+        iva_perc = iva_ricette.get(riga.get("id_ricetta")) if riga.get("id_ricetta") else iva_articoli.get(riga.get("id_prodotto_commerciale"))
+        quantita = riga["quantita"] or 0
+
+        if usa_totale:
+            # Il valore AUTORITATIVO qui è il totale: lo scorporiamo
+            # direttamente (non unitario*quantità) per non perdere i
+            # centesimi, stesso principio già in uso per gli import bulk
+            # (vedi registra_vendite_bulk). L'unitario è solo derivato, per
+            # coerenza visiva altrove nell'app.
+            totale_lordo_riga = valore_lordo
+            prezzo_lordo_riga = round2(valore_lordo / quantita) if quantita else valore_lordo
+        else:
+            # Qui l'AUTORITATIVO è l'unitario: il totale segue da
+            # quantità * unitario, come già faceva questo endpoint.
+            prezzo_lordo_riga = valore_lordo
+            totale_lordo_riga = round(quantita * valore_lordo, 2)
+
+        prezzo_netto = _scorpora_iva(prezzo_lordo_riga, iva_perc)
+        if prezzo_netto is None:
+            prezzo_netto = prezzo_lordo_riga  # aliquota IVA sconosciuta: nessuno scorporo possibile
+
+        totale_netto = _scorpora_iva(totale_lordo_riga, iva_perc)
+        if totale_netto is None:
+            totale_netto = totale_lordo_riga
+
         payload = {
-            "prezzo_singolo": nuovo_prezzo,
-            "prezzo_totale": round(riga["quantita"] * nuovo_prezzo, 2),
+            "prezzo_singolo": prezzo_netto,
+            "prezzo_totale": totale_netto,
+            "prezzo_singolo_lordo": prezzo_lordo_riga,
+            "prezzo_totale_lordo": totale_lordo_riga,
         }
-        if snap["prezzo_singolo_lordo"] is not None:
-            payload["prezzo_singolo_lordo"] = snap["prezzo_singolo_lordo"]
-            payload["prezzo_totale_lordo"] = snap["prezzo_totale_lordo"]
         supabase.table("vendite").update(payload).eq("id", riga["id"]).execute()
         aggiornate += 1
 
@@ -726,42 +726,81 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
         
         sospesa = res.data[0]
 
-        # Il prezzo salvato su una vendita sospesa è SEMPRE lordo grezzo, mai
-        # netto: senza un prodotto abbinato non c'era un'aliquota IVA nota con
-        # cui scorporarlo al momento dell'inserimento (vedi registra_vendite_bulk).
-        # Ora che il prodotto è noto, recuperiamo la sua aliquota reale e
-        # scorporiamo qui, per la prima volta, il valore in netto.
-        prezzo_lordo_sospesa = round2(sospesa.get("prezzo_singolo"))
-        if prezzo_lordo_sospesa is not None:
-            iva_ricette, iva_articoli = _get_iva_rates_batch(
-                [data.id_ricetta] if data.id_ricetta else [],
-                [data.id_prodotto_commerciale] if data.id_prodotto_commerciale else [],
-            )
-            iva_perc = iva_ricette.get(data.id_ricetta) if data.id_ricetta else iva_articoli.get(data.id_prodotto_commerciale)
-            prezzo_singolo = _scorpora_iva(prezzo_lordo_sospesa, iva_perc)
+        # Quantità e data: usa le correzioni dell'utente se presenti (righe
+        # importate da Excel spesso hanno l'una o l'altra sbagliata), altrimenti
+        # quelle già salvate sulla riga sospesa.
+        quantita_finale = data.quantita if data.quantita is not None else sospesa["quantita"]
+        data_vendita_finale = data.data_vendita.isoformat() if data.data_vendita is not None else sospesa["data_vendita"]
+
+        # Aliquota IVA del prodotto ora noto: serve per scorporare in netto sia
+        # che il lordo venga dalla riga importata sia che l'utente lo abbia
+        # corretto qui sotto.
+        iva_ricette, iva_articoli = _get_iva_rates_batch(
+            [data.id_ricetta] if data.id_ricetta else [],
+            [data.id_prodotto_commerciale] if data.id_prodotto_commerciale else [],
+        )
+        iva_perc = iva_ricette.get(data.id_ricetta) if data.id_ricetta else iva_articoli.get(data.id_prodotto_commerciale)
+
+        if data.prezzo_totale_lordo is not None:
+            # L'utente ha corretto il totale LORDO: è questo il valore
+            # autoritativo, l'unitario si ricava dividendolo per la quantità
+            # finale (stesso principio di aggiorna_prezzo_bulk in modalità totale).
+            totale_lordo = round2(data.prezzo_totale_lordo)
+            prezzo_singolo_lordo = round2(totale_lordo / quantita_finale) if quantita_finale else totale_lordo
+        else:
+            # Il prezzo salvato su una vendita sospesa è SEMPRE lordo grezzo,
+            # mai netto: senza un prodotto abbinato non c'era un'aliquota IVA
+            # nota con cui scorporarlo al momento dell'inserimento (vedi
+            # registra_vendite_bulk).
+            prezzo_singolo_lordo = round2(sospesa.get("prezzo_singolo"))
+            totale_lordo = round(quantita_finale * prezzo_singolo_lordo, 2) if prezzo_singolo_lordo is not None else None
+
+        # Ora che il prodotto è noto, scorporiamo qui, per la prima volta, i
+        # valori in netto (il totale si scorpora direttamente, non da
+        # unitario*quantità, per non perdere i centesimi — stesso principio
+        # già in uso per gli import bulk e per aggiorna_prezzo_bulk).
+        if prezzo_singolo_lordo is not None:
+            prezzo_singolo = _scorpora_iva(prezzo_singolo_lordo, iva_perc)
+            if prezzo_singolo is None:
+                prezzo_singolo = prezzo_singolo_lordo
         else:
             # Nessun prezzo rilevato sullo scontrino/excel: usiamo il listino
             # netto attuale del prodotto ora noto (già netto, nessuno scorporo).
             prezzo_singolo = round2(_get_listino_price(data.id_ricetta, data.id_prodotto_commerciale))
 
-        prezzo_totale = round(sospesa["quantita"] * prezzo_singolo, 2) if prezzo_singolo is not None else None
+        if totale_lordo is not None:
+            prezzo_totale = _scorpora_iva(totale_lordo, iva_perc)
+            if prezzo_totale is None:
+                prezzo_totale = totale_lordo
+        else:
+            prezzo_totale = round(quantita_finale * prezzo_singolo, 2) if prezzo_singolo is not None else None
 
-        # Solo ora che il prodotto è noto possiamo congelare food cost e
-        # prezzo lordo, esattamente come su una vendita registrata subito con
-        # il prodotto già associato.
-        snap = _snapshot_riga_singola(data.id_ricetta, data.id_prodotto_commerciale, prezzo_singolo, sospesa["quantita"])
+        # Food cost: dipende solo dal prodotto (costo attuale), non dal
+        # prezzo di vendita corretto qui sopra — lo congeliamo comunque sulla
+        # riga, esattamente come su una vendita registrata subito col
+        # prodotto già associato.
+        food_cost_ricette, food_cost_articoli, _, _ = _get_costi_lordi_batch(
+            [data.id_ricetta] if data.id_ricetta else [],
+            [data.id_prodotto_commerciale] if data.id_prodotto_commerciale else [],
+        )
+        food_cost_unitario = food_cost_ricette.get(data.id_ricetta) if data.id_ricetta else food_cost_articoli.get(data.id_prodotto_commerciale)
 
         # Crea la vendita reale
         record = {
-            "data_vendita": sospesa["data_vendita"],
-            "quantita": sospesa["quantita"],
+            "data_vendita": data_vendita_finale,
+            "quantita": quantita_finale,
             "id_sede": auth_data["id_sede"],
             "id_ricetta": data.id_ricetta,
             "id_prodotto_commerciale": data.id_prodotto_commerciale,
             "prezzo_singolo": prezzo_singolo,
             "prezzo_totale": prezzo_totale,
-            **snap,
         }
+        if prezzo_singolo_lordo is not None:
+            record["prezzo_singolo_lordo"] = prezzo_singolo_lordo
+            record["prezzo_totale_lordo"] = totale_lordo
+        if food_cost_unitario is not None:
+            record["food_cost_unitario"] = round2(food_cost_unitario)
+            record["food_cost_totale"] = round(food_cost_unitario * quantita_finale, 2)
 
         # Inserisci in vendite
         supabase.table("vendite").insert(record).execute()
@@ -967,6 +1006,7 @@ def export_vendite(
 from fastapi import UploadFile, File
 from fastapi.responses import StreamingResponse
 from utils.ai_parser import parse_vendite_excel_with_ai_stream
+from utils.ai_usage import check_and_log_ai_usage
 
 @router.post("/import/upload")
 async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(get_user_sede)):
@@ -974,6 +1014,7 @@ async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(g
     Riceve il file Excel/CSV, lo legge e lo invia a Gemini per l'estrazione delle vendite.
     Ritorna uno stream NDJSON per aggiornamenti di progresso progressivi e il risultato finale.
     """
+    check_and_log_ai_usage(auth_data["id_sede"], "import_excel_vendite")
     content = await file.read()
     filename = file.filename
     

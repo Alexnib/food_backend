@@ -1,6 +1,8 @@
 import os
 import time
 import json
+import asyncio
+import logging
 from google import genai
 from google.genai import types
 import pandas as pd
@@ -8,11 +10,102 @@ from typing import List, Optional
 import io
 from models.magazzino import ParsedResult, FatturaParseResult
 
-def parse_excel_with_ai(excel_file_bytes: bytes, filename: str, categorie_disponibili: list) -> str:
+logger = logging.getLogger(__name__)
+
+# Timeout per singola chiamata Gemini: prima di questa modifica nessuna delle
+# funzioni di questo file ne aveva uno (confermato: `generate_content` senza
+# `http_options` usa il timeout di default dell'SDK, che di fatto è "nessuno"
+# per le richieste più lente), quindi un modello sovraccarico o un problema di
+# rete poteva lasciare una richiesta appesa indefinitamente, senza feedback
+# per l'utente e senza modo di riprovare. I blocchi testuali (Excel) sono più
+# leggeri dei documenti multimodali (scontrini/fatture): due soglie diverse.
+#
+# _TIMEOUT_TESTO_MS era 45s: in un caso reale, due blocchi di un import
+# materie prime hanno esaurito tutti i 5 tentativi con lo stesso identico
+# errore Gemini (504 DEADLINE_EXCEEDED) — segno che 45s erano troppo pochi
+# per quei blocchi (non un blip transitorio: se lo fosse stato, sarebbe
+# bastato UN retry a risolverlo). Alzato a 90s per dare più respiro a
+# ciascun tentativo; per restare comunque sotto il timeout lato frontend di
+# useImportMagazzino.ts (300s), il numero di tentativi in parse_excel_with_ai
+# è stato ridotto in cambio (vedi commento lì) — più tempo a testa, meno
+# tentativi, invece di tanti tentativi troppo brevi per essere utili.
+_TIMEOUT_TESTO_MS = 90_000
+_TIMEOUT_MULTIMODALE_MS = 60_000
+
+# Righe massime per import Excel (vendite e materie prime): un file più
+# grande di così va diviso in più caricamenti — evita tempi di elaborazione e
+# costi Gemini illimitati su un singolo upload (prima di questa modifica non
+# esisteva alcun limite in nessuno dei due importatori).
+MAX_RIGHE_EXCEL = 5000
+
+# Fatture caricabili in un solo batch: parse_fattura_with_ai fa UNA sola
+# chiamata Gemini con tutti i file insieme, con max_output_tokens=32768 fisso
+# — troppe fatture con troppe righe prodotto totali rischiano di troncare il
+# JSON di risposta a metà prima che sia completo. 20 file, con fatture reali
+# (10-30 righe l'una), resta con ampio margine sotto quella soglia.
+MAX_FILE_FATTURA = 20
+
+
+# Istruzione per il punto 5 del prompt (prezzi), diversa a seconda di cosa
+# l'utente ha dichiarato contenere il file — prima di questa modifica l'AI
+# doveva SEMPRE indovinare se una colonna prezzo isolata fosse netta o
+# lorda, senza alcun contesto: dirglielo in anticipo toglie l'ambiguità e
+# riduce gli errori di interpretazione. "entrambi" resta il comportamento
+# di sempre (comportamento di default se il chiamante non specifica nulla),
+# solo reso più esplicito sul fatto che vanno cercate due colonne separate
+# invece di dedurne una dall'altra quando entrambe sono presenti.
+_ISTRUZIONI_PREZZO = {
+    "lordo": (
+        "5. 'costo_netto' e 'costo_lordo': il file contiene SOLO il prezzo LORDO "
+        "(IVA inclusa) — la colonna prezzo che trovi è sempre il lordo. Valorizza "
+        "'costo_lordo' con quel valore così com'è scritto, poi calcola 'costo_netto' "
+        "scorporando l'IVA (Netto = Lordo / (1 + iva_perc/100)). NON esiste una "
+        "colonna netta separata in questo file: non cercarla, non confonderla con "
+        "altre colonne numeriche. Arrotonda sempre a 2 decimali."
+    ),
+    "netto": (
+        "5. 'costo_netto' e 'costo_lordo': il file contiene SOLO il prezzo NETTO "
+        "(IVA esclusa, imponibile) — la colonna prezzo che trovi è sempre il netto. "
+        "Valorizza 'costo_netto' con quel valore così com'è scritto, poi calcola "
+        "'costo_lordo' aggiungendo l'IVA (Lordo = Netto * (1 + iva_perc/100)). NON "
+        "esiste una colonna lorda separata in questo file: non cercarla, non "
+        "confonderla con altre colonne numeriche. Arrotonda sempre a 2 decimali."
+    ),
+    "entrambi": (
+        "5. 'costo_netto' e 'costo_lordo': il file contiene ENTRAMBI i prezzi in "
+        "colonne separate (una IVA esclusa, l'altra IVA inclusa) — individua le due "
+        "colonne corrispondenti ed estrai i valori così come sono scritti, senza "
+        "calcolarli tu. Solo se per una riga manca uno dei due valori, calcolalo "
+        "dall'altro usando l'IVA (Lordo = Netto * (1 + iva_perc/100)). Arrotonda "
+        "sempre a 2 decimali."
+    ),
+}
+
+
+async def parse_excel_with_ai(excel_file_bytes: bytes, filename: str, categorie_disponibili: list, tipo_prezzo: str = "entrambi") -> str:
     """
-    Legge il file excel o csv, lo converte in testo e lo invia a Gemini.
-    Ritorna la stringa JSON validata.
+    Legge il file excel o csv delle materie prime/articoli, lo converte in
+    testo e lo invia a Gemini a blocchi. Ritorna la stringa JSON validata.
+
+    Elaborazione parallela (stesso modello di parse_vendite_excel_with_ai_stream,
+    blocchi da 50 righe con concorrenza limitata a 5): la versione precedente
+    era sequenziale con retry a `time.sleep()` bloccante, il che aveva due
+    problemi — tempi lineari con la dimensione del file, e un `time.sleep()`
+    dentro una route `async def` senza thread-pool blocca l'intero event loop
+    del server per la durata dell'intera elaborazione, rallentando anche le
+    richieste di altri utenti nel frattempo. Un blocco che esaurisce i retry
+    non manda più in errore l'intero import (prima: tutti i blocchi già
+    estratti con successo venivano scartati) — viene segnalato in
+    "errori_parziali" e il resto dei blocchi continua comunque.
+
+    tipo_prezzo: "lordo" | "netto" | "entrambi" — dichiarato dall'utente in
+    fase di caricamento su cosa contiene il file, per non far indovinare
+    all'AI se una colonna prezzo isolata sia netta o lorda (vedi
+    _ISTRUZIONI_PREZZO).
     """
+    if tipo_prezzo not in _ISTRUZIONI_PREZZO:
+        raise ValueError(f"tipo_prezzo non valido: '{tipo_prezzo}' (atteso: lordo, netto o entrambi).")
+
     try:
         if filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(excel_file_bytes))
@@ -21,25 +114,32 @@ def parse_excel_with_ai(excel_file_bytes: bytes, filename: str, categorie_dispon
     except Exception as e:
         raise ValueError(f"Errore nella lettura del file: {str(e)}")
 
+    if len(df) > MAX_RIGHE_EXCEL:
+        raise ValueError(
+            f"Il file ha {len(df)} righe, oltre il limite di {MAX_RIGHE_EXCEL}: dividilo in più caricamenti."
+        )
+
     cat_string = "\n".join([
-        f"ID: {c.get('id')} - Nome: {c.get('nome_categoria')} - Tipo: {c.get('tipo_categoria', 'Sconosciuto')}" 
+        f"ID: {c.get('id')} - Nome: {c.get('nome_categoria')} - Tipo: {c.get('tipo_categoria', 'Sconosciuto')}"
         for c in categorie_disponibili
     ])
+    istruzione_prezzo = _ISTRUZIONI_PREZZO[tipo_prezzo]
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY non configurata.")
 
     client = genai.Client(api_key=api_key)
-    
-    import json
-    all_products = []
-    chunk_size = 100
 
-    for i in range(0, len(df), chunk_size):
-        chunk_df = df.iloc[i:i+chunk_size]
+    chunk_size = 50
+    total_rows = len(df)
+    total_chunks = (total_rows + chunk_size - 1) // chunk_size
+    sem = asyncio.Semaphore(5)
+
+    async def process_chunk(start_row):
+        chunk_df = df.iloc[start_row:start_row + chunk_size]
         csv_string = chunk_df.to_csv(index=False)
-        
+
         prompt = f"""
 Sei un assistente esperto in ristorazione e magazzino in Italia.
 Ti sto per fornire un file CSV (o estratto di Excel) caricato da un ristoratore.
@@ -51,7 +151,7 @@ Per ogni prodotto:
 2. 'tipo': Valuta attentamente la natura del prodotto. Imposta "Materia Prima" per cibi/bevande usati per cucinare. Imposta "Rivendita" per prodotti venduti così come sono. Imposta "Entrambi" se il prodotto viene sia usato per preparazioni sia venduto direttamente al cliente (es. bibite, vini, birre). Imposta "Costo" per tutto ciò che NON è food/beverage ma è materiale di consumo, attrezzature, pulizia (es. bicchieri di plastica, cannucce, tovaglioli, detersivi, carta igienica).
 3. 'unita_misura': Estrai o deduci l'unità di misura (kg, lt, pz).
 4. 'iva_perc': Estrai l'IVA se c'è. Se l'IVA manca, applica l'aliquota italiana corretta in base al prodotto (solitamente 10% per alimenti/bevande in ristorazione, o 22%, o 4%).
-5. 'costo_netto' e 'costo_lordo': Estraili. Se ne manca uno, calcolalo usando l'IVA. (Lordo = Netto * (1 + iva_perc/100)). Arrotonda sempre a 2 decimali.
+{istruzione_prezzo}
 6. 'id_categoria': Scegli l'ID della categoria più adatta tra questa lista fornita. Se nessuna si adatta, imposta null.
 
 Lista Categorie Disponibili:
@@ -65,41 +165,75 @@ Dati caricati:
 Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
 """
 
+        # Retry con backoff esponenziale (2s, 4s), non bloccante
+        # (asyncio.sleep), per assorbire un 503/504 temporaneo. Solo 3
+        # tentativi (non 5 come in parse_vendite_excel_with_ai_stream,
+        # che non ha invece un timeout lato frontend a cui stare sotto):
+        # con _TIMEOUT_TESTO_MS a 90s, il caso peggiore per un blocco è
+        # 3*90 + (2+4) = 276s, sotto ai 300s del timeout frontend
+        # (useImportMagazzino.ts) con un margine di sicurezza di ~25s.
+        # Più tentativi con lo stesso timeout non aiuterebbero comunque un
+        # blocco che ha bisogno di più tempo per essere elaborato, solo
+        # uno che fallisce per un blip davvero transitorio.
         max_retries = 3
         chunk_result = None
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ParsedResult,
-                        temperature=0.1
-                    ),
-                )
-                chunk_result = response.text
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                raise ValueError(f"Errore AI dopo {max_retries} tentativi nel blocco {i}: {str(e)}")
-        
-        if chunk_result:
-            try:
-                parsed_chunk = json.loads(chunk_result)
-                prodotti = parsed_chunk.get("prodotti", [])
-                for p in prodotti:
-                    if p.get("costo_netto") is not None:
-                        p["costo_netto"] = round(float(p["costo_netto"]), 2)
-                    if p.get("costo_lordo") is not None:
-                        p["costo_lordo"] = round(float(p["costo_lordo"]), 2)
-                all_products.extend(prodotti)
-            except Exception as e:
-                raise ValueError(f"Errore parsing JSON nel blocco {i}: {str(e)}")
+        last_error = None
 
-    return json.dumps({"prodotti": all_products})
+        async with sem:
+            for attempt in range(max_retries):
+                try:
+                    response = await client.aio.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ParsedResult,
+                            temperature=0.1,
+                            http_options=types.HttpOptions(timeout=_TIMEOUT_TESTO_MS),
+                        ),
+                    )
+                    chunk_result = response.text
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+        if chunk_result is None:
+            riga_da = start_row + 1
+            riga_a = start_row + len(chunk_df)
+            return {"prodotti": [], "errore": f"Righe {riga_da}-{riga_a} del file: {str(last_error)}"}
+
+        try:
+            parsed_chunk = json.loads(chunk_result)
+        except Exception as e:
+            riga_da = start_row + 1
+            riga_a = start_row + len(chunk_df)
+            return {"prodotti": [], "errore": f"Righe {riga_da}-{riga_a} del file: risposta AI non interpretabile ({str(e)})"}
+
+        prodotti = parsed_chunk.get("prodotti", [])
+        for p in prodotti:
+            if p.get("costo_netto") is not None:
+                p["costo_netto"] = round(float(p["costo_netto"]), 2)
+            if p.get("costo_lordo") is not None:
+                p["costo_lordo"] = round(float(p["costo_lordo"]), 2)
+        return {"prodotti": prodotti, "errore": None}
+
+    tasks = [process_chunk(i) for i in range(0, total_rows, chunk_size)]
+    all_products = []
+    blocchi_falliti = []
+    for future in asyncio.as_completed(tasks):
+        esito = await future
+        all_products.extend(esito["prodotti"])
+        if esito["errore"]:
+            logger.warning("parse_excel_with_ai: blocco fallito - %s", esito["errore"])
+            blocchi_falliti.append(esito["errore"])
+
+    result_payload = {"prodotti": all_products}
+    if blocchi_falliti:
+        result_payload["errori_parziali"] = blocchi_falliti
+    return json.dumps(result_payload)
 
 
 def parse_fattura_with_ai(files: List[tuple]) -> str:
@@ -119,6 +253,9 @@ def parse_fattura_with_ai(files: List[tuple]) -> str:
     scelta resta sempre dell'utente nella schermata di conferma, come già
     per l'import da Excel.
     """
+    if len(files) > MAX_FILE_FATTURA:
+        raise ValueError(f"Troppi file in un solo caricamento ({len(files)}): il limite è {MAX_FILE_FATTURA}.")
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY non configurata.")
@@ -173,6 +310,7 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto. Nessun comme
                     max_output_tokens=32768,
                     response_mime_type="application/json",
                     response_schema=FatturaParseResult,
+                    http_options=types.HttpOptions(timeout=_TIMEOUT_MULTIMODALE_MS),
                 ),
             )
             parsed = json.loads(response.text)
@@ -228,13 +366,18 @@ async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: 
     except Exception as e:
         raise ValueError(f"Errore nella lettura del file: {str(e)}")
 
+    if len(df) > MAX_RIGHE_EXCEL:
+        raise ValueError(
+            f"Il file ha {len(df)} righe, oltre il limite di {MAX_RIGHE_EXCEL}: dividilo in più caricamenti."
+        )
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY non configurata.")
 
     # Uso del client asincrono
     client = genai.Client(api_key=api_key)
-    
+
     all_vendite = []
     chunk_size = 50
     total_rows = len(df)
@@ -249,32 +392,31 @@ async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: 
         
         prompt = f"""
 Sei un assistente esperto in analisi dati per la ristorazione.
-Ti sto fornendo un file CSV (o estratto di Excel) caricato da un ristoratore contenente le vendite dei prodotti.
+Ti sto fornendo un file EXCEL o CSV caricato da un ristoratore contenente le vendite dei prodotti.
 Potrebbe essere disordinato, avere colonne senza nome o avere formati di data vari.
+Analizza il contenuto RIGA per RIGA
 
 Il tuo compito è estrarre l'elenco delle vendite e restituirlo come un JSON che rispetti questo schema rigorosamente:
 {{
   "vendite": [
     {{
       "nome_prodotto_estratto": "Nome del prodotto venduto",
-      "quantita": 10.5,
+      "quantita": 3,
       "data_vendita": "YYYY-MM-DD",
-      "prezzo_singolo": 4.5,
-      "prezzo_totale": 47.25,
-      "prezzo_lordo": true
+      "prezzo_totale_lordo": 60.0,
+
     }}
   ]
 }}
 
 Regole:
+DI PRIMARIA IMPORTANZA: Il campo prezzo_totale_lordo deve essere SEMPRE valorizzato, non può mai essere null
 1. 'nome_prodotto_estratto': Estrai o deduci chiaramente il nome del prodotto.
 2. 'quantita': Numero intero o decimale rappresentante la quantità venduta.
 3. 'data_vendita': Trasforma qualsiasi formato di data presente nel file nel formato ISO "YYYY-MM-DD" (es: 2026-07-13). Se non è presente una data in una riga, cerca di dedurla dalle righe precedenti.
 4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA del file CSV fornitoti. Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide nel CSV.
-5. 'prezzo_singolo' e 'prezzo_totale' (OPZIONALI): SOLO se il file contiene colonne di prezzo per quella riga. 'prezzo_singolo' è il prezzo di UNA unità del prodotto; 'prezzo_totale' è il ricavo complessivo della riga (prezzo_singolo * quantita, o un importo già totale presente nel file). Estrai quello/i che trovi così come sono scritti, senza inventarli né calcolarli tu se manca l'informazione: se il file NON ha nessuna colonna riconducibile a un prezzo/importo/ricavo, lascia ENTRAMBI i campi a null. Se trovi solo uno dei due (es. solo il totale di riga, o solo il prezzo unitario), valorizza solo quello e lascia l'altro a null.
-6. 'prezzo_lordo' (SOLO se hai estratto un prezzo, altrimenti null): imposta SEMPRE 'prezzo_lordo' a true, senza eccezioni — anche se una colonna sembra dichiararsi "netta"/"imponibile", anche se i decimali sembrano "puliti" o "strani" (nessuno di questi è un indizio affidabile: dipende solo da come il gestore ha impostato i prezzi del locale, non dal fatto che un valore sia netto o lordo). Un file di vendite come questo esporta l'incasso REALE per riga, cioè quello che il cliente ha pagato, IVA inclusa: è sempre lordo. Il netto lo scorpora il sistema a valle usando l'aliquota del prodotto abbinato (o quella indicata nel documento se nota) — non è un compito tuo, e non devi mai dedurlo, calcolarlo o "correggerlo" tu qui.
-7. Se il file contiene PIÙ colonne di importo per la stessa riga (es. una "lorda"/"con IVA" e una "netta"/"imponibile" affiancate): estrai il valore dalla colonna LORDA/con IVA come prezzo_singolo o prezzo_totale e ignora del tutto quella netta, anche se ti sembra più "pulita" o più affidabile. 'prezzo_lordo' resta comunque true, come da punto 6, senza eccezioni. Il sistema deriva sempre da solo il netto corretto; non affidarti mai a un netto già calcolato nel file, potrebbe essere impostato in modo incoerente col resto del listino.
-8. Ignora completamente colonne che non riguardano la vendita in sé: food cost, margine, categoria/famiglia del prodotto, o colonne di supporto calcolate dalla data (anno, mese, giorno della settimana). Non fanno parte dello schema richiesto: non estrarle, non sommarle e non usarle per dedurre altri campi.
+5. Se il file contiene PIÙ colonne di importo per la stessa riga (es. una "lorda"/"con IVA" e una "netta"/"imponibile" affiancate): estrai il valore dalla colonna LORDA/con IVA come prezzo_totale_lordo e ignora del tutto quella netta
+6. Ignora completamente colonne che non riguardano la vendita in sé: food cost, margine, categoria/famiglia del prodotto, o colonne di supporto calcolate dalla data (anno, mese, giorno della settimana). Non fanno parte dello schema richiesto: non estrarle, non sommarle e non usarle per dedurre altri campi.
 
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
 """
@@ -306,6 +448,7 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
                             thinking_config=types.ThinkingConfig(thinking_budget=0),
                             response_mime_type="application/json",
                             response_schema=ParsedVenditaResult,
+                            http_options=types.HttpOptions(timeout=_TIMEOUT_TESTO_MS),
                         )
                     )
                     parsed_chunk = json.loads(response.text)

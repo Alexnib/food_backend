@@ -1,23 +1,38 @@
 import os
 import json
 import re
+import asyncio
+import logging
 # Rimosso base64 perché non serve più con il nuovo SDK
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from typing import List
 
 # Importa genai e i types per gestire le immagini
 from google import genai
-from google.genai import types 
+from google.genai import types
 
 from database.config import Database
 from utils.auth_utils import get_user_sede
+from utils.ai_usage import check_and_log_ai_usage
+from models.vendite import ScontrinoItem
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ai-scanner", tags=["AI Scanner"])
 supabase = Database.get_client()
 
-# Configura il client Gemini con la chiave API (Ottimo!)
+# Configura il client Gemini con la chiave API. Manca una guardia esplicita
+# se GEMINI_API_KEY non è impostata: con questo fallback l'app parte
+# comunque e il problema emerge solo alla prima scansione reale, con un
+# errore SDK poco chiaro — accettato per ora, coerente con com'era prima.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "LA_TUA_CHIAVE") # Ricorda di non esporla
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Immagini caricabili in un solo scan: oltre questo numero il tempo di
+# elaborazione e il costo per richiesta crescono senza un limite (prima di
+# questa modifica non esisteva alcun tetto).
+MAX_IMMAGINI_SCONTRINO = 10
+_TIMEOUT_SCAN_MS = 60_000
 
 
 def _build_prompt(menu_json: str) -> str:
@@ -103,6 +118,7 @@ async def scan_receipts(
     che hanno trovato corrispondenza nel menù (filtro di scarto).
     NON salva nulla nel DB.
     """
+    check_and_log_ai_usage(auth_data["id_sede"], "scan_scontrini")
     # 1. Recupera l'intero menù della sede (esclusi i prodotti eliminati: non ha
     # senso far associare l'IA a un prodotto non più in vendita).
     finiti_res = supabase.table("ricette").select(
@@ -131,6 +147,12 @@ async def scan_receipts(
             detail="Nessun prodotto trovato nel tuo menù. Carica prima i prodotti nel gestionale."
         )
 
+    if len(files) > MAX_IMMAGINI_SCONTRINO:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Troppe immagini in una sola scansione ({len(files)}): il limite è {MAX_IMMAGINI_SCONTRINO}."
+        )
+
     menu_json_str = json.dumps(menu, ensure_ascii=False)
     prompt_text = _build_prompt(menu_json_str)
 
@@ -140,7 +162,7 @@ async def scan_receipts(
     for file in files:
         content = await file.read()
         mime_type = file.content_type or "image/jpeg"
-        
+
         # NUOVA SINTASSI: Usiamo types.Part.from_bytes per iniettare l'immagine
         image_part = types.Part.from_bytes(
             data=content,
@@ -151,19 +173,41 @@ async def scan_receipts(
     if len(contents) == 1: # Significa che c'è solo il prompt text, niente file
         raise HTTPException(status_code=400, detail="Nessuna immagine ricevuta.")
 
-    # 3. Chiama Gemini
-    try:
-        response = client.models.generate_content(
-            model='gemini-3.1-flash-image-preview',
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0)
-        )
-        raw_text = response.text.strip()
-        print(f"Risposta grezza da Gemini: {raw_text}")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Errore Gemini: {str(e)}")
+    # 3. Chiama Gemini — prima di questa modifica era l'unica delle tre
+    # funzioni AI del backend senza alcun retry (un 503 "modello sovraccarico"
+    # falliva subito l'intera scansione) e senza response_schema (il JSON di
+    # Gemini non era vincolato a nessuno schema, a differenza degli altri due
+    # flussi). Client asincrono (client.aio) invece di quello sincrono usato
+    # prima: con i retry, una chiamata sincrona bloccante dentro una route
+    # async avrebbe bloccato l'event loop del server per la somma di tutti i
+    # tentativi, non solo per uno.
+    max_retries = 5
+    response = None
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = await client.aio.models.generate_content(
+                model='gemini-3.1-flash-image-preview',
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=list[ScontrinoItem],
+                    temperature=0.0,
+                    http_options=types.HttpOptions(timeout=_TIMEOUT_SCAN_MS),
+                )
+            )
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+    if response is None:
+        raise HTTPException(status_code=502, detail=f"Errore Gemini dopo {max_retries} tentativi: {str(last_error)}")
+
+    raw_text = response.text.strip()
+    logger.info("Scan completato, %d caratteri di risposta da Gemini", len(raw_text))
 
     # 4. Parsing e Arricchimento Dati
     try:
@@ -197,8 +241,10 @@ async def scan_receipts(
     output_tokens = response.usage_metadata.candidates_token_count
     total_tokens = response.usage_metadata.total_token_count
 
-    print(f"Token usati - Input: {input_tokens}, Output: {output_tokens}, Totale: {total_tokens}")
-    print(f"Risultati arricchiti: {json.dumps(arricchiti, ensure_ascii=False, indent=2)}")
+    logger.info(
+        "Scan scontrini sede=%s: %d voci estratte, token input=%d output=%d totale=%d",
+        auth_data["id_sede"], len(arricchiti), input_tokens, output_tokens, total_tokens,
+    )
     return {
         "risultati": arricchiti, 
         "totale_rilevati": len(arricchiti)

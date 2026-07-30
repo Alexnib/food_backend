@@ -3,6 +3,7 @@ from database.config import Database
 from models.magazzino import *
 from utils.auth_utils import get_user_sede
 from utils.numbers import round2
+from utils.db_fetch import call_rpc_or_none
 from routers.produzione import ricalcola_costo_ricette
 
 router = APIRouter(prefix="/api/magazzino", tags=["Magazzino"])
@@ -45,20 +46,38 @@ def create_categoria(data: CategoriaProdottoCreate, auth_data = Depends(get_user
     res = supabase.table("categoria_prodotti").insert(insert_data).execute()
     return res.data[0]
 
+def _get_categorie(id_sede: str, id_macro_categoria: int = None) -> list:
+    """
+    Percorso veloce: get_categorie_prodotti (sql/012) fa il join con
+    provenienza_prodotto/destinazione_prodotto dentro Postgres, evitando il
+    resource embedding di PostgREST (lo stesso tipo già mostratosi
+    inaffidabile altrove, vedi database/config.py). Fallback identico se non
+    ancora creata.
+    """
+    rows = call_rpc_or_none(
+        "get_categorie_prodotti",
+        {"p_id_sede": id_sede, "p_id_macro_categoria": id_macro_categoria},
+        order_cols=["id"],
+    )
+    if rows is not None:
+        return rows
+
+    query = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", id_sede)
+    if id_macro_categoria is not None:
+        query = query.eq("id_macro_categoria", id_macro_categoria)
+    return query.execute().data
+
 @router.get("/categorie")
 def get_categorie(auth_data = Depends(get_user_sede)):
-    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", auth_data["id_sede"]).execute()
-    return res.data
+    return _get_categorie(auth_data["id_sede"])
 
 @router.get("/categorie/rivendita")
 def get_categorie_rivendita(auth_data = Depends(get_user_sede)):
-    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", auth_data["id_sede"]).eq("id_macro_categoria", 1).execute()
-    return res.data
+    return _get_categorie(auth_data["id_sede"], 1)
 
 @router.get("/categorie/ricette")
 def get_categorie_ricette(auth_data = Depends(get_user_sede)):
-    res = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", auth_data["id_sede"]).eq("id_macro_categoria", 2).execute()
-    return res.data
+    return _get_categorie(auth_data["id_sede"], 2)
 
 @router.put("/categorie/{id}")
 def update_categoria(id: int, data: CategoriaProdottoUpdate, auth_data = Depends(get_user_sede)):
