@@ -1026,4 +1026,15 @@ async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(g
             import json
             yield json.dumps({"error": str(e)}) + "\n"
 
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    # Content-Encoding esplicito per disattivare il GZipMiddleware globale
+    # (vedi main.py) su questa risposta: senza questo, Starlette bufferizza
+    # ogni chunk nel proprio compressore zlib e non lo inoltra al client
+    # finché il buffer non supera "minimum_size" o lo stream non si chiude —
+    # tutti gli eventi di progresso arriverebbero insieme solo alla fine,
+    # azzerando la barra di avanzamento anche se il backend li genera
+    # correttamente uno alla volta (stesso bug/fix di import_magazzino.py).
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={"Content-Encoding": "identity"},
+    )

@@ -1,7 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from database.config import Database
 from utils.auth_utils import get_user_sede
-from utils.ai_parser import parse_excel_with_ai, parse_fattura_with_ai, MAX_FILE_FATTURA
+from utils.ai_parser import parse_excel_with_ai_stream, parse_fattura_with_ai, MAX_FILE_FATTURA
 from utils.ai_usage import check_and_log_ai_usage
 from typing import List, Optional
 import json
@@ -33,23 +34,38 @@ async def upload_excel_for_import(
 
     # 2. Leggi il file
     content = await file.read()
+    filename = file.filename
 
-    # 3. Manda a Gemini — parse_excel_with_ai ora è asincrona ed elabora i
-    # blocchi in parallelo (vedi utils/ai_parser.py): un errore di validazione
-    # nostro (es. limite righe superato) o un errore AI diventano entrambi un
-    # 400, ma solo dopo aver rispettato eventuali timeout/retry impostati lì.
-    try:
-        json_str = await parse_excel_with_ai(content, file.filename, categorie, tipo_prezzo)
-        data = json.loads(json_str)
-        return data
-    except ValueError as e:
-        # parse_excel_with_ai solleva ValueError per problemi di dati/input
-        # (file illeggibile, limite righe superato, errore AI dopo tutti i
-        # retry): un vero 400, causato da cosa l'utente ha caricato.
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("upload_excel_for_import: errore inatteso")
-        raise HTTPException(status_code=500, detail="Errore interno durante l'analisi del file. Riprova più tardi.")
+    # 3. Manda a Gemini — parse_excel_with_ai_stream elabora i blocchi in
+    # parallelo (vedi utils/ai_parser.py) e restituisce uno stream NDJSON con
+    # il progresso via via che ogni blocco finisce, stesso schema di
+    # /api/vendite/import/upload: un errore di validazione nostro (es.
+    # limite righe superato) o un errore AI arrivano entrambi come riga
+    # {"error": ...} nello stream, non più come HTTPException, perché gli
+    # header della risposta sono già stati inviati al client a quel punto.
+    async def event_generator():
+        try:
+            async for chunk in parse_excel_with_ai_stream(content, filename, categorie, tipo_prezzo):
+                yield chunk
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+
+    # Content-Encoding esplicito per disattivare il GZipMiddleware globale
+    # (vedi main.py) su questa risposta: senza questo, Starlette bufferizza
+    # ogni chunk dentro il proprio compressore zlib e non lo inoltra davvero
+    # al client finché il buffer non supera "minimum_size" o lo stream non si
+    # chiude — per una StreamingResponse fatta di tante righe minuscole come
+    # questa, significa che TUTTI gli eventi di progresso arrivano insieme
+    # solo alla fine, azzerando la barra di avanzamento lato frontend anche
+    # se il backend li genera correttamente uno alla volta. Verificato con un
+    # test isolato: identico stream, senza questo header tutti gli eventi
+    # arrivavano nello stesso istante finale, con questo header arrivavano
+    # scaglionati nel tempo come generati.
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={"Content-Encoding": "identity"},
+    )
 
 @router.post("/upload-fattura")
 async def upload_fattura_for_import(files: List[UploadFile] = File(...), auth_data = Depends(get_user_sede)):
@@ -111,10 +127,9 @@ def save_imported_products(request: SaveImportRequest, auth_data = Depends(get_u
                 "prezzo_acquisto_netto": item.costo_netto,
                 "prezzo_acquisto_lordo": item.costo_lordo,
                 "id_iva_acquisto": id_iva,
-                # Prima non veniva mai salvata per le materie prime (il
-                # frontend non la chiedeva nemmeno): ora è obbligatoria in
-                # ImportazioneExcelModal.tsx per ogni tipo di prodotto, va
-                # quindi effettivamente persistita anche qui.
+                # Per una materia prima pura il frontend non chiede la
+                # categoria (è legata solo a rivendita/costi): item.id_categoria
+                # arriva quindi None, salvato così com'è.
                 "id_categoria_prodotto": item.id_categoria,
                 "fornitore": fornitore,
                 "anno": anno_corrente,

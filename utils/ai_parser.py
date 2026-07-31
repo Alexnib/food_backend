@@ -82,10 +82,14 @@ _ISTRUZIONI_PREZZO = {
 }
 
 
-async def parse_excel_with_ai(excel_file_bytes: bytes, filename: str, categorie_disponibili: list, tipo_prezzo: str = "entrambi") -> str:
+async def parse_excel_with_ai_stream(excel_file_bytes: bytes, filename: str, categorie_disponibili: list, tipo_prezzo: str = "entrambi"):
     """
     Legge il file excel o csv delle materie prime/articoli, lo converte in
-    testo e lo invia a Gemini a blocchi. Ritorna la stringa JSON validata.
+    testo e lo invia a Gemini a blocchi. Restituisce un generatore asincrono
+    (yield) con aggiornamenti di progresso ({"progress": pct}) e infine il
+    risultato completo ({"result": {...}}) — stesso schema NDJSON di
+    parse_vendite_excel_with_ai_stream, per poter mostrare all'utente una
+    barra di avanzamento reale invece di uno spinner senza percentuale.
 
     Elaborazione parallela (stesso modello di parse_vendite_excel_with_ai_stream,
     blocchi da 50 righe con concorrenza limitata a 5): la versione precedente
@@ -165,17 +169,17 @@ Dati caricati:
 Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
 """
 
-        # Retry con backoff esponenziale (2s, 4s), non bloccante
-        # (asyncio.sleep), per assorbire un 503/504 temporaneo. Solo 3
-        # tentativi (non 5 come in parse_vendite_excel_with_ai_stream,
-        # che non ha invece un timeout lato frontend a cui stare sotto):
-        # con _TIMEOUT_TESTO_MS a 90s, il caso peggiore per un blocco è
-        # 3*90 + (2+4) = 276s, sotto ai 300s del timeout frontend
-        # (useImportMagazzino.ts) con un margine di sicurezza di ~25s.
-        # Più tentativi con lo stesso timeout non aiuterebbero comunque un
-        # blocco che ha bisogno di più tempo per essere elaborato, solo
-        # uno che fallisce per un blip davvero transitorio.
-        max_retries = 3
+        # Retry con backoff esponenziale, non bloccante (asyncio.sleep), per
+        # assorbire un 503/504 temporaneo (es. "modello sovraccarico"). Prima
+        # erano solo 3 tentativi per stare sotto un timeout fisso lato
+        # frontend (axios, 300s): ora che l'upload passa da una fetch/stream
+        # NDJSON senza timeout fisso (vedi magazzinoService.uploadExcelImport),
+        # quel vincolo non c'è più — allineato a 5 tentativi come
+        # parse_vendite_excel_with_ai_stream, per dare più margine a un blocco
+        # prima di arrendersi (vedi anche il fallimento totale più sotto: un
+        # blocco che esaurisce anche questi tentativi fa fallire l'intero
+        # import, quindi vale la pena insistere di più qui).
+        max_retries = 5
         chunk_result = None
         last_error = None
 
@@ -223,17 +227,31 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
     tasks = [process_chunk(i) for i in range(0, total_rows, chunk_size)]
     all_products = []
     blocchi_falliti = []
+    completed_chunks = 0
     for future in asyncio.as_completed(tasks):
         esito = await future
         all_products.extend(esito["prodotti"])
         if esito["errore"]:
-            logger.warning("parse_excel_with_ai: blocco fallito - %s", esito["errore"])
+            logger.warning("parse_excel_with_ai_stream: blocco fallito - %s", esito["errore"])
             blocchi_falliti.append(esito["errore"])
+        completed_chunks += 1
+
+        progress_pct = int((completed_chunks / total_chunks) * 100)
+        yield json.dumps({"progress": progress_pct}) + "\n"
+
+    if blocchi_falliti:
+        # Mai consegnare un'estrazione parziale: se anche un solo blocco non
+        # è stato analizzato dopo tutti i tentativi, l'intero import fallisce
+        # e va ripetuto da capo, invece di far arrivare in tabella un
+        # risultato con alcune righe silenziosamente mancanti che l'utente
+        # potrebbe non notare e salvare per sbaglio. Il router (vedi
+        # import_magazzino.py) intercetta questa eccezione e la inoltra come
+        # evento {"error": ...} nello stream, esattamente come un errore di
+        # validazione a monte.
+        raise ValueError("Impossibile analizzare l'intero file: " + "; ".join(blocchi_falliti))
 
     result_payload = {"prodotti": all_products}
-    if blocchi_falliti:
-        result_payload["errori_parziali"] = blocchi_falliti
-    return json.dumps(result_payload)
+    yield json.dumps({"result": result_payload}) + "\n"
 
 
 def parse_fattura_with_ai(files: List[tuple]) -> str:
@@ -462,10 +480,9 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
         if parsed_chunk is not None:
             return {"vendite": parsed_chunk.get("vendite", []), "errore": None}
 
-        # Un blocco fallito non deve far perdere TUTTE le vendite già estratte
-        # dagli altri blocchi: lo segnaliamo (con l'intervallo di righe del
-        # file coinvolto) invece di sollevare un'eccezione che interromperebbe
-        # l'intero import.
+        # Non solleviamo subito un'eccezione qui: lasciamo che asyncio.as_completed
+        # più sotto raccolga comunque il progresso di TUTTI i blocchi (compresi
+        # quelli riusciti) prima di decidere se far fallire l'intero import.
         riga_da = start_row + 1
         riga_a = start_row + len(chunk_df)
         return {
@@ -492,15 +509,20 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
         progress_pct = int((completed_chunks / total_chunks) * 100)
         yield json.dumps({"progress": progress_pct}) + "\n"
 
+    if blocchi_falliti:
+        # Mai consegnare un'estrazione parziale: se anche un solo blocco non
+        # è stato analizzato dopo tutti i tentativi (es. sovraccarico
+        # temporaneo dell'AI), l'intero import fallisce e va ripetuto da
+        # capo, invece di far arrivare in tabella un risultato con alcune
+        # vendite silenziosamente mancanti che l'utente potrebbe non notare
+        # e salvare per sbaglio. Il router (routers/vendite.py) intercetta
+        # questa eccezione e la inoltra come evento {"error": ...} nello
+        # stream, esattamente come un errore di validazione a monte.
+        raise ValueError("Impossibile analizzare l'intero file: " + "; ".join(blocchi_falliti))
+
     final_json = json.dumps({"vendite": all_vendite})
     # Validazione Pydantic
     ParsedVenditaResult.model_validate_json(final_json)
 
-    # Invio evento di completamento e risultato finale. Se uno o più blocchi
-    # sono falliti (es. sovraccarico temporaneo dell'AI) dopo tutti i
-    # tentativi, lo segnaliamo con gli intervalli di righe coinvolti: il resto
-    # del file, comunque estratto correttamente, non va perso.
     result_payload = {"vendite": all_vendite}
-    if blocchi_falliti:
-        result_payload["errori_parziali"] = blocchi_falliti
     yield json.dumps({"result": result_payload}) + "\n"
