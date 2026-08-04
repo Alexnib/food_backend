@@ -9,6 +9,7 @@ import pandas as pd
 from typing import List, Optional
 import io
 from models.magazzino import ParsedResult, FatturaParseResult
+from models.produzione import ParsedRicetteResult
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,12 @@ _TIMEOUT_MULTIMODALE_MS = 60_000
 # costi Gemini illimitati su un singolo upload (prima di questa modifica non
 # esisteva alcun limite in nessuno dei due importatori).
 MAX_RIGHE_EXCEL = 5000
+
+# Ricette massime per import: a differenza di materie prime/vendite (chunk a
+# righe fisse), qui si chunka per ricette complete (vedi sotto) — un tetto
+# sul NUMERO di ricette, non solo sulle righe totali, evita comunque un
+# singolo upload con un numero di chiamate Gemini illimitato.
+MAX_RICETTE_EXCEL = 300
 
 # Fatture caricabili in un solo batch: parse_fattura_with_ai fa UNA sola
 # chiamata Gemini con tutti i file insieme, con max_output_tokens=32768 fisso
@@ -78,6 +85,33 @@ _ISTRUZIONI_PREZZO = {
         "calcolarli tu. Solo se per una riga manca uno dei due valori, calcolalo "
         "dall'altro usando l'IVA (Lordo = Netto * (1 + iva_perc/100)). Arrotonda "
         "sempre a 2 decimali."
+    ),
+}
+
+# Istruzione per il prezzo di VENDITA delle ricette (diverso dal prezzo di
+# ACQUISTO delle materie prime sopra): qui non calcoliamo mai lordo<->netto
+# nel prompt, perché l'aliquota IVA di vendita non viene dal file ma scelta
+# dall'utente nella schermata di revisione — se il file ne fornisce solo uno
+# dei due, l'altro resta null e viene calcolato lato frontend con l'IVA
+# scelta lì, non qui.
+_ISTRUZIONI_PREZZO_VENDITA = {
+    "lordo": (
+        "il file contiene SOLO il prezzo di vendita LORDO (IVA inclusa) — "
+        "valorizza 'prezzo_vendita_lordo' con quel valore così com'è scritto "
+        "e lascia 'prezzo_vendita_netto' a null (verrà calcolato altrove con "
+        "l'aliquota scelta dall'utente). Arrotonda a 2 decimali."
+    ),
+    "netto": (
+        "il file contiene SOLO il prezzo di vendita NETTO (IVA esclusa) — "
+        "valorizza 'prezzo_vendita_netto' con quel valore così com'è scritto "
+        "e lascia 'prezzo_vendita_lordo' a null. Arrotonda a 2 decimali."
+    ),
+    "entrambi": (
+        "il file contiene ENTRAMBI i prezzi di vendita in colonne separate "
+        "(uno IVA esclusa, l'altro IVA inclusa) — individua le due colonne ed "
+        "estrai i valori così come sono scritti, senza calcolarli tu. Se per "
+        "una ricetta manca uno dei due valori, lascialo null. Arrotonda a 2 "
+        "decimali."
     ),
 }
 
@@ -404,15 +438,37 @@ async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: 
     # Semaphoro per limitare il numero di richieste contemporanee a Gemini (es. max 5)
     sem = asyncio.Semaphore(5)
 
+    # Stessa protezione già usata per le ricette: un "|" letterale dentro un
+    # valore romperebbe le colonne della tabella Markdown.
+    def _escape_pipe(testo) -> str:
+        return str(testo).replace("|", "/")
+
     async def process_chunk(idx, start_row):
         chunk_df = df.iloc[start_row : start_row + chunk_size]
-        csv_string = chunk_df.to_csv(index=False)
-        
+
+        # Tabella Markdown invece del CSV grezzo, con una colonna "Riga"
+        # esplicita — stessa modifica già fatta per le ricette (vedi
+        # parse_ricette_excel_with_ai_stream): è quello che ha risolto lì un
+        # bug reale in cui l'AI, a parità di altri campi, fondeva/deduplicava
+        # righe che sembravano ripetute (es. stesso prodotto venduto più
+        # volte nello stesso giorno). Un numero di riga esplicito rende ogni
+        # riga strutturalmente distinta anche quando i valori sono identici,
+        # cosa che nessuna istruzione testuale da sola è bastata a garantire
+        # in modo robusto a scala reale.
+        intestazioni = [_escape_pipe(c) for c in chunk_df.columns]
+        riga_intestazione = "| Riga | " + " | ".join(intestazioni) + " |"
+        riga_separatore = "|---|" + "---|" * len(intestazioni)
+        righe_tabella = []
+        for j, (_, riga) in enumerate(chunk_df.iterrows()):
+            valori = ["" if pd.isna(v) else _escape_pipe(v) for v in riga]
+            righe_tabella.append(f"| {j + 1} | " + " | ".join(valori) + " |")
+        tabella_md = "\n".join([riga_intestazione, riga_separatore] + righe_tabella)
+
         prompt = f"""
 Sei un assistente esperto in analisi dati per la ristorazione.
-Ti sto fornendo un file EXCEL o CSV caricato da un ristoratore contenente le vendite dei prodotti.
-Potrebbe essere disordinato, avere colonne senza nome o avere formati di data vari.
-Analizza il contenuto RIGA per RIGA
+Ti sto fornendo una tabella con le vendite dei prodotti, caricata da un ristoratore a partire da un file Excel o CSV e formatta in Markdown.
+Potrebbe essere disordinata, avere colonne senza nome o avere formati di data vari.
+Analizza il contenuto RIGA per RIGA, usando la colonna "Riga" per riferirti a ciascuna riga senza ambiguità.
 
 Il tuo compito è estrarre l'elenco delle vendite e restituirlo come un JSON che rispetti questo schema rigorosamente:
 {{
@@ -432,12 +488,21 @@ DI PRIMARIA IMPORTANZA: Il campo prezzo_totale_lordo deve essere SEMPRE valorizz
 1. 'nome_prodotto_estratto': Estrai o deduci chiaramente il nome del prodotto.
 2. 'quantita': Numero intero o decimale rappresentante la quantità venduta.
 3. 'data_vendita': Trasforma qualsiasi formato di data presente nel file nel formato ISO "YYYY-MM-DD" (es: 2026-07-13). Se non è presente una data in una riga, cerca di dedurla dalle righe precedenti.
-4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA del file CSV fornitoti. Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide nel CSV.
+4. TASSATIVO: Assicurati di estrarre e mappare OGNI SINGOLA RIGA della tabella fornita, identificata dal numero in colonna "Riga". Non raggruppare, non sommare, non filtrare e NON TRALASCIARE nessuna riga per alcun motivo, anche se due righe sembrano identiche o quasi identiche in tutti i campi: righe con un numero di "Riga" diverso sono SEMPRE righe diverse e vanno SEMPRE riportate entrambe. L'array JSON finale deve avere un numero di elementi pari al numero di righe valide della tabella.
 5. Se il file contiene PIÙ colonne di importo per la stessa riga (es. una "lorda"/"con IVA" e una "netta"/"imponibile" affiancate): estrai il valore dalla colonna LORDA/con IVA come prezzo_totale_lordo e ignora del tutto quella netta
-6. Ignora completamente colonne che non riguardano la vendita in sé: food cost, margine, categoria/famiglia del prodotto, o colonne di supporto calcolate dalla data (anno, mese, giorno della settimana). Non fanno parte dello schema richiesto: non estrarle, non sommarle e non usarle per dedurre altri campi.
+6. Ignora completamente colonne che non riguardano la vendita in sé: food cost, margine, categoria/famiglia del prodotto, o colonne di supporto calcolate dalla data (anno, mese, giorno della settimana). Non fanno parte dello schema richiesto: non estrarle, non sommarle e non usarle per dedurre altri campi. La colonna "Riga" stessa non fa parte dello schema: serve solo per riferirti alle righe, non va riportata nell'output.
+
+Tabella:
+{tabella_md}
 
 Restituisci SOLO il JSON valido. Nessun commento o markdown.
 """
+
+        # Log temporaneo su richiesta esplicita (stessa esigenza già chiesta
+        # per le ricette): print(), non logger, perché non esiste ancora
+        # nessuna configurazione di logging nel progetto. Da togliere quando
+        # non serve più.
+        print(f"\n{'=' * 80}\n[VENDITE] PROMPT INVIATO A GEMINI (chunk {idx}):\n{'=' * 80}\n{prompt}\n{'=' * 80}\n")
         # Retry con backoff esponenziale (2s, 4s, 8s, 16s, 32s): un errore 503
         # "modello sovraccarico" da parte di Gemini è quasi sempre temporaneo
         # (pochi secondi/minuti), ma con un'attesa fissa di soli 2s e 3
@@ -451,10 +516,7 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
                 try:
                     response = await client.aio.models.generate_content(
                         model='gemini-2.5-flash',
-                        contents=[
-                            prompt,
-                            f"Dati caricati:\n```csv\n{csv_string}\n```"
-                        ],
+                        contents=prompt,
                         config=types.GenerateContentConfig(
                             temperature=0.1,
                             max_output_tokens=16384,
@@ -470,9 +532,11 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
                         )
                     )
                     parsed_chunk = json.loads(response.text)
+                    print(f"\n{'=' * 80}\n[VENDITE] RISPOSTA GEMINI (chunk {idx}, tentativo {attempt + 1}):\n{'=' * 80}\n{response.text}\n{'=' * 80}\n")
                     break
                 except Exception as e:
                     last_error = e
+                    print(f"\n[VENDITE] ERRORE al tentativo {attempt + 1} (chunk {idx}): {e}\n")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2 ** attempt)
                         continue
@@ -525,4 +589,414 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
     ParsedVenditaResult.model_validate_json(final_json)
 
     result_payload = {"vendite": all_vendite}
+    yield json.dumps({"result": result_payload}) + "\n"
+
+
+def _testo_a_float(testo) -> Optional[float]:
+    """Converte in float un testo numerico, tollerando la virgola italiana
+    come separatore decimale (es. "634,75") oltre al punto standard."""
+    try:
+        return float(testo)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(str(testo).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
+
+def _correggi_quantita_con_originali(ricette_estratte: list, blocchi_chunk: list) -> None:
+    """
+    Sostituisce 'quantita' di ogni ingrediente estratto con il valore ESATTO
+    già letto in modo deterministico dal file in Python (blocchi_chunk),
+    invece di fidarsi del numero ritrascritto dall'AI — in prova, con file
+    reali, capitava che l'AI restituisse valori diversi da quelli scritti
+    nel file (in un caso reale, "normalizzava" le quantità di una ricetta
+    fino a farle sommare esattamente a 1000, come se applicasse da sé una
+    convenzione "grammi per kg" invece di copiare i numeri dati). La
+    quantità non ha bisogno dell'AI per essere letta: la conosciamo già
+    riga per riga da prima ancora di chiamarla; l'AI serve solo per il nome
+    ripulito dell'ingrediente, la categoria e il raggruppamento — non per
+    "leggere" un numero che abbiamo già in mano.
+
+    L'abbinamento ricetta-estratta -> blocco-originale avviene per
+    'id_blocco' (l'indice del blocco nel chunk, che l'AI deve solo
+    RIPORTARE, non interpretare) — non per nome: abbinare per nome falliva
+    silenziosamente ogni volta che l'AI "ripuliva" il nome anche di un solo
+    carattere (richiesto esplicitamente dal punto 1 del prompt), lasciando
+    silenziosamente le quantità sbagliate dell'AI al posto di quelle vere.
+
+    Applicata solo se il numero di ingredienti restituiti per una ricetta
+    coincide con quello originale (altrimenti l'AI ha saltato/aggiunto
+    righe, un problema diverso da questo, e non tocchiamo nulla per non
+    peggiorare un disallineamento già presente).
+    """
+    for ricetta in ricette_estratte:
+        id_blocco = ricetta.get("id_blocco")
+        if not isinstance(id_blocco, int) or id_blocco < 0 or id_blocco >= len(blocchi_chunk):
+            print(f"[RICETTE] id_blocco mancante o non valido per '{ricetta.get('nome_ricetta')}': {id_blocco!r} — quantità NON corrette per questa ricetta.")
+            continue
+        blocco_originale = blocchi_chunk[id_blocco]
+
+        ingredienti_estratti = ricetta.get("ingredienti") or []
+        righe_originali = blocco_originale["righe"]
+        if len(ingredienti_estratti) != len(righe_originali):
+            print(
+                f"[RICETTE] '{ricetta.get('nome_ricetta')}' (id_blocco={id_blocco}): "
+                f"{len(ingredienti_estratti)} ingredienti restituiti dall'AI contro "
+                f"{len(righe_originali)} nel file — quantità NON corrette per questa ricetta."
+            )
+            continue
+
+        for ing_estratto, riga_originale in zip(ingredienti_estratti, righe_originali):
+            testo = riga_originale["quantita_testo"]
+            if testo == "MANCANTE":
+                continue
+            valore_originale = _testo_a_float(testo)
+            if valore_originale is not None:
+                ing_estratto["quantita"] = valore_originale
+
+        ricetta.pop("id_blocco", None)  # riferimento interno: non deve arrivare al frontend
+
+
+async def parse_ricette_excel_with_ai_stream(
+    excel_file_bytes: bytes,
+    filename: str,
+    categorie_disponibili: list,
+    prezzo_vendita_presente: bool = False,
+    tipo_prezzo_vendita: str = "entrambi",
+):
+    """
+    Legge il file excel/csv delle ricette e lo invia a Gemini a blocchi.
+    Restituisce un generatore asincrono (yield) con aggiornamenti di
+    progresso ({"progress": pct}) e infine il risultato completo
+    ({"result": {...}}) — stesso schema NDJSON degli altri importatori,
+    stesso comportamento "tutto o niente" su un blocco che esaurisce i
+    retry (vedi parse_excel_with_ai_stream).
+
+    A differenza degli altri due importatori, qui il file è "melted": una
+    riga per ingrediente, più righe consecutive condividono lo stesso nome
+    ricetta. Chunkare a righe fisse (come materie prime/vendite) rischierebbe
+    di spezzare una ricetta a metà tra due chiamate AI parallele — invece il
+    raggruppamento in ricette complete avviene qui in Python PRIMA di
+    chiamare Gemini (deterministico, il file ha già la struttura necessaria),
+    e si chunka per RICETTE complete, mai per righe. Il compito dell'AI si
+    riduce a ripulire nomi, scegliere la categoria e trascrivere gli
+    ingredienti — non a indovinare dove finisce una ricetta e ne inizia
+    un'altra, né a risolvere l'ingrediente a un id di catalogo (quello è
+    fuzzy matching deterministico lato frontend, vedi prodottoMatching.ts).
+
+    prezzo_vendita_presente/tipo_prezzo_vendita: dichiarati dall'utente in
+    fase di caricamento (stesso principio di tipo_prezzo per le materie
+    prime — dichiarare, non far indovinare all'AI se il file ha o meno un
+    prezzo di vendita, né se una colonna isolata sia netta o lorda). Se
+    presente, il file deve avere una 5ª colonna col prezzo di vendita.
+    """
+    if tipo_prezzo_vendita not in _ISTRUZIONI_PREZZO_VENDITA:
+        raise ValueError(f"tipo_prezzo_vendita non valido: '{tipo_prezzo_vendita}' (atteso: lordo, netto o entrambi).")
+    try:
+        if filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(excel_file_bytes))
+        else:
+            # Stesso pattern di parse_vendite_excel_with_ai_stream: legge
+            # tutti i fogli e sceglie quello con più righe, invece di
+            # fidarsi ciecamente del primo (un file può avere fogli extra
+            # non pertinenti, es. note o istruzioni).
+            excel_file = pd.ExcelFile(io.BytesIO(excel_file_bytes))
+            fogli = {nome: excel_file.parse(nome) for nome in excel_file.sheet_names}
+            nome_foglio_scelto = max(fogli, key=lambda nome: len(fogli[nome]))
+            df = fogli[nome_foglio_scelto]
+    except Exception as e:
+        raise ValueError(f"Errore nella lettura del file: {str(e)}")
+
+    if df.empty:
+        raise ValueError("Il file non contiene righe da importare.")
+
+    if len(df) > MAX_RIGHE_EXCEL:
+        raise ValueError(
+            f"Il file ha {len(df)} righe, oltre il limite di {MAX_RIGHE_EXCEL}: dividilo in più caricamenti."
+        )
+
+    # Le colonne attese (nome ricetta, categoria, ingrediente, quantità, ed
+    # eventualmente prezzo di vendita) sono individuate per POSIZIONE, non
+    # per nome esatto dell'header: l'utente ha chiesto esplicitamente un
+    # approccio flessibile, e non c'è garanzia che l'intestazione sia
+    # scritta esattamente come nel file di riferimento.
+    colonne = list(df.columns)
+    # "entrambi" richiede DUE colonne separate (netto e lordo), non una sola
+    # da cui l'AI dovrebbe indovinare quale sia quale.
+    n_colonne_prezzo = 2 if (prezzo_vendita_presente and tipo_prezzo_vendita == "entrambi") else (1 if prezzo_vendita_presente else 0)
+    min_colonne = 4 + n_colonne_prezzo
+    if len(colonne) < min_colonne:
+        raise ValueError(
+            f"Il file deve avere almeno {min_colonne} colonne: nome ricetta, categoria, ingrediente, quantità"
+            + (", prezzo di vendita netto e lordo." if n_colonne_prezzo == 2
+               else ", prezzo di vendita." if n_colonne_prezzo == 1 else ".")
+        )
+    col_nome, col_categoria, col_ingrediente, col_quantita = colonne[0], colonne[1], colonne[2], colonne[3]
+
+    col_prezzo_netto = None
+    col_prezzo_lordo = None
+    if prezzo_vendita_presente:
+        if tipo_prezzo_vendita == "entrambi":
+            col_prezzo_netto, col_prezzo_lordo = colonne[4], colonne[5]
+        elif tipo_prezzo_vendita == "netto":
+            col_prezzo_netto = colonne[4]
+        else:  # "lordo"
+            col_prezzo_lordo = colonne[4]
+
+    # ffill: alcuni export scrivono il nome ricetta/categoria/prezzo solo
+    # sulla prima riga del gruppo (celle unite in Excel), lasciando le righe
+    # successive vuote — senza questo perderebbero il collegamento alla
+    # ricetta a cui appartengono.
+    df[col_nome] = df[col_nome].ffill()
+    df[col_categoria] = df[col_categoria].ffill()
+    if col_prezzo_netto is not None:
+        df[col_prezzo_netto] = df[col_prezzo_netto].ffill()
+    if col_prezzo_lordo is not None:
+        df[col_prezzo_lordo] = df[col_prezzo_lordo].ffill()
+
+    # Raggruppamento per BLOCCO CONSECUTIVO, non un groupby per nome: due
+    # ricette con lo stesso nome ma non adiacenti nel file restano due
+    # ricette distinte, non vengono fuse in una sola.
+    blocchi = []
+    blocco_corrente = None
+    for _, riga in df.iterrows():
+        nome_ricetta = str(riga[col_nome]).strip() if pd.notna(riga[col_nome]) else ""
+        if not nome_ricetta:
+            continue
+        if blocco_corrente is None or blocco_corrente["nome_ricetta"] != nome_ricetta:
+            prezzo_netto_testo = None
+            if col_prezzo_netto is not None and pd.notna(riga[col_prezzo_netto]):
+                prezzo_netto_testo = str(riga[col_prezzo_netto]).strip()
+            prezzo_lordo_testo = None
+            if col_prezzo_lordo is not None and pd.notna(riga[col_prezzo_lordo]):
+                prezzo_lordo_testo = str(riga[col_prezzo_lordo]).strip()
+            blocco_corrente = {
+                "nome_ricetta": nome_ricetta,
+                "categoria": str(riga[col_categoria]).strip() if pd.notna(riga[col_categoria]) else "",
+                "prezzo_netto_testo": prezzo_netto_testo,
+                "prezzo_lordo_testo": prezzo_lordo_testo,
+                "righe": [],
+            }
+            blocchi.append(blocco_corrente)
+        ingrediente = str(riga[col_ingrediente]).strip() if pd.notna(riga[col_ingrediente]) else ""
+        if not ingrediente:
+            continue
+        quantita_raw = riga[col_quantita]
+        blocco_corrente["righe"].append({
+            "ingrediente": ingrediente,
+            "quantita_testo": str(quantita_raw) if pd.notna(quantita_raw) else "MANCANTE",
+        })
+
+    blocchi = [b for b in blocchi if b["righe"]]
+    if not blocchi:
+        raise ValueError("Non è stata trovata nessuna ricetta valida nel file.")
+
+    if len(blocchi) > MAX_RICETTE_EXCEL:
+        raise ValueError(
+            f"Il file ha {len(blocchi)} ricette, oltre il limite di {MAX_RICETTE_EXCEL}: dividilo in più caricamenti."
+        )
+
+    cat_string = "\n".join([
+        f"ID: {c.get('id')} - Nome: {c.get('nome_categoria')}"
+        for c in categorie_disponibili
+    ])
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY non configurata.")
+
+    client = genai.Client(api_key=api_key)
+
+    ricette_per_chunk = 15
+    total_ricette = len(blocchi)
+    total_chunks = (total_ricette + ricette_per_chunk - 1) // ricette_per_chunk
+    sem = asyncio.Semaphore(5)
+
+    istruzione_prezzo_vendita = (
+        _ISTRUZIONI_PREZZO_VENDITA[tipo_prezzo_vendita] if prezzo_vendita_presente
+        else "il file NON contiene un prezzo di vendita: lascia sempre 'prezzo_vendita_netto' e 'prezzo_vendita_lordo' a null."
+    )
+
+    # Markdown invece di un elenco a bullet: intestazione colonne scritta
+    # una sola volta per ricetta (più economico del JSON, che ripeterebbe
+    # le chiavi per ogni riga), e struttura a colonne esplicita che lascia
+    # meno margine di interpretazione rispetto a un formato "nome: valore"
+    # libero — i modelli sono addestrati massicciamente su tabelle
+    # Markdown, è il formato tabellare de facto nei prompt.
+    def _escape_pipe(testo) -> str:
+        # Un "|" nel testo spezzerebbe le colonne della tabella.
+        return str(testo).replace("|", "/")
+
+    async def process_chunk(blocchi_chunk):
+        testo_blocchi = []
+        for i, b in enumerate(blocchi_chunk):
+            # Colonna "Riga" (solo per Gemini, non fa parte dei dati): con
+            # ricette che hanno lo stesso ingrediente ripetuto più volte
+            # (quantità diverse), abbiamo verificato che l'AI a volte le
+            # tratta come "duplicati" e le unisce in una sola riga, nonostante
+            # l'istruzione esplicita di non farlo — un numero univoco per
+            # riga rende ogni riga visibilmente distinta anche quando il
+            # nome ingrediente è identico, disincentivando la deduplica alla
+            # radice invece di fare leva solo sul testo dell'istruzione.
+            righe_tabella = "\n".join(
+                f"| {j + 1} | {_escape_pipe(r['ingrediente'])} | {_escape_pipe(r['quantita_testo'])} |"
+                for j, r in enumerate(b["righe"])
+            )
+            meta_bits = [f"- Categoria nel file: {b['categoria'] or 'non indicata'}"]
+            if b.get("prezzo_netto_testo"):
+                meta_bits.append(f"- Prezzo vendita netto nel file: {b['prezzo_netto_testo']}")
+            if b.get("prezzo_lordo_testo"):
+                meta_bits.append(f"- Prezzo vendita lordo nel file: {b['prezzo_lordo_testo']}")
+            meta_testo = "\n".join(meta_bits)
+            testo_blocchi.append(
+                f"### RICETTA (id_blocco={i}): {b['nome_ricetta']}\n"
+                f"{meta_testo}\n\n"
+                f"| Riga | Ingrediente | Quantità |\n"
+                f"|---|---|---|\n"
+                f"{righe_tabella}"
+            )
+        testo = "\n\n".join(testo_blocchi)
+
+        prompt = f"""
+Sei un assistente esperto in ristorazione in Italia.
+Ti fornisco un elenco di ricette raggruppate, ciascuna con i propri ingredienti e quantità in un file EXCEL o CSV, formattate in Markdown (intestazione ### per ricetta, tabella per gli ingredienti).
+
+Analizza ogni ricetta rigorosamente RIGA per RIGA della tabella e restituisci un JSON che rispetti questo schema:
+0. 'id_blocco': RIPORTA esattamente il numero indicato tra parentesi "id_blocco=" per quella ricetta, senza modificarlo, calcolarlo o dedurlo — è un riferimento interno, non fa parte del nome né della ricetta stessa.
+1. 'nome_ricetta': il nome della ricetta, ripulito da spazi/refusi evidenti ma SENZA cambiarne il significato.
+2. 'id_categoria': scegli l'ID della categoria più adatta tra questa lista, usando anche la categoria indicata nel file come indizio. Se nessuna si adatta con sicurezza, imposta null — non indovinare.
+3. 'prezzo_vendita_netto' e 'prezzo_vendita_lordo': {istruzione_prezzo_vendita}
+4. 'ingredienti': un elenco con, per ciascuna riga della tabella "Riga | Ingrediente | Quantità" fornita (la colonna "Riga" è solo un numero di riferimento per distinguere righe con lo stesso ingrediente: non fa parte del nome, non includerla nel JSON):
+   - 'nome_ingrediente_estratto': il nome dell'ingrediente (colonna "Ingrediente") ripulito da spazi superflui, MA conservane il testo originale (incluse eventuali indicazioni di formato/confezione come "5kg" o "6x1kg") — servirà per abbinarlo a un catalogo, quindi non semplificarlo né accorciarlo.
+   - 'quantita': COPIA il numero della colonna "Quantità" esattamente come scritto per quella riga, cifra per cifra — non calcolarlo, non stimarlo, non arrotondarlo, non sostituirlo con un valore tipico che conosci per quella ricetta. Se è "MANCANTE", imposta 0.
+TASSATIVO: non saltare nessuna ricetta e nessuna riga della tabella tra quelle fornite, non inventarne di nuove, non unire ricette diverse. Restituisci gli ingredienti di ogni ricetta nello STESSO ORDINE (stessa sequenza di "Riga") della tabella. Se lo STESSO nome ingrediente compare su più righe della stessa ricetta (numeri di "Riga" diversi, anche con quantità diverse o quasi identiche), sono RIGHE DIVERSE: NON deduplicare, NON unirle in una sola — restituisci un elemento separato per OGNI numero di "Riga", esattamente come faresti se i nomi ingrediente fossero diversi tra loro. Il numero di elementi in 'ingredienti' DEVE essere identico al numero di righe della tabella di quella ricetta, sempre, senza eccezioni.
+
+Ecco un esempio di dati presente nel file Excel (con id_blocco=5 come sarebbe indicato nella sezione "Ricette da elaborare" qui sotto):
+### RICETTA (id_blocco=5): AGRUMI
+- Categoria nel file: SORBETTI
+
+| Riga | Ingrediente | Quantità |
+|---|---|---|
+| 1 | acqua | 70,80 |
+| 2 | joybase delymix 50 6x1kg | 241,22 |
+| 3 | joyplus prosoft 6kg (6x1kg) | 643,73 |
+
+Il json finale che deve restituire questo esempio di ricetta è:
+{{
+  "ricette": [
+    {{
+      "id_blocco": 5,
+      "nome_ricetta": "AGRUMI",
+      "id_categoria": 123,
+        "prezzo_vendita_netto": 0,
+        "prezzo_vendita_lordo": 0,
+        "ingredienti": [
+            {{
+                "nome_ingrediente_estratto": "acqua",
+                "quantita": 70.80
+            }},
+            {{
+                "nome_ingrediente_estratto": "joybase delymix 50 6x1kg",
+                "quantita": 241.22
+            }},
+            {{
+                "nome_ingrediente_estratto": "joyplus prosoft 6kg (6x1kg)",
+                "quantita": 643.73
+            }}
+        ]
+    }}
+  ]
+}}
+
+Lista Categorie Disponibili:
+{cat_string}
+
+Ricette da elaborare:
+{testo}
+
+Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
+"""
+
+        # Log temporaneo su richiesta esplicita (debug del prompt appena
+        # modificato): print(), non logger, perché non esiste ancora nessuna
+        # configurazione di logging nel progetto (nessun basicConfig/handler
+        # da nessuna parte) — un logger.info() qui non comparirebbe affatto
+        # nel terminale. Da togliere quando non serve più.
+        print(f"\n{'=' * 80}\n[RICETTE] PROMPT INVIATO A GEMINI:\n{'=' * 80}\n{prompt}\n{'=' * 80}\n")
+
+        # gemini-2.5-flash, non un modello "pro": il raggruppamento delle
+        # righe in ricette (la parte davvero non banale) è già fatto in
+        # Python PRIMA di arrivare qui (vedi sopra) — il compito che resta
+        # all'AI (ripulire nomi, scegliere una categoria da una lista data,
+        # trascrivere ingredienti/quantità) è lo stesso genere di estrazione
+        # strutturata già affidata a flash per materie prime/vendite. Un
+        # modello "pro" qui è stato provato e scartato: più lento (l'utente
+        # ha segnalato tempi di attesa concreti) e più soggetto a 503 "alta
+        # domanda" essendo in preview, senza un reale bisogno di ragionamento
+        # più sofisticato per questo compito ormai già scomposto.
+        max_retries = 5
+        chunk_result = None
+        last_error = None
+
+        async with sem:
+            for attempt in range(max_retries):
+                try:
+                    response = await client.aio.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=ParsedRicetteResult,
+                            temperature=0.1,
+                            http_options=types.HttpOptions(timeout=_TIMEOUT_TESTO_MS),
+                        ),
+                    )
+                    chunk_result = response.text
+                    print(f"\n{'=' * 80}\n[RICETTE] RISPOSTA GEMINI (tentativo {attempt + 1}):\n{'=' * 80}\n{chunk_result}\n{'=' * 80}\n")
+                    break
+                except Exception as e:
+                    last_error = e
+                    print(f"\n[RICETTE] ERRORE al tentativo {attempt + 1}: {e}\n")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+        nomi_blocco = ", ".join(b["nome_ricetta"] for b in blocchi_chunk)
+        if chunk_result is None:
+            return {"ricette": [], "errore": f"Ricette '{nomi_blocco}': {str(last_error)}"}
+
+        try:
+            parsed_chunk = json.loads(chunk_result)
+        except Exception as e:
+            return {"ricette": [], "errore": f"Ricette '{nomi_blocco}': risposta AI non interpretabile ({str(e)})"}
+
+        ricette_estratte = parsed_chunk.get("ricette", [])
+        _correggi_quantita_con_originali(ricette_estratte, blocchi_chunk)
+        return {"ricette": ricette_estratte, "errore": None}
+
+    chunks_di_blocchi = [blocchi[i:i + ricette_per_chunk] for i in range(0, total_ricette, ricette_per_chunk)]
+    tasks = [process_chunk(c) for c in chunks_di_blocchi]
+
+    all_ricette = []
+    blocchi_falliti = []
+    completed_chunks = 0
+    for future in asyncio.as_completed(tasks):
+        esito = await future
+        all_ricette.extend(esito["ricette"])
+        if esito["errore"]:
+            logger.warning("parse_ricette_excel_with_ai_stream: blocco fallito - %s", esito["errore"])
+            blocchi_falliti.append(esito["errore"])
+        completed_chunks += 1
+
+        progress_pct = int((completed_chunks / total_chunks) * 100)
+        yield json.dumps({"progress": progress_pct}) + "\n"
+
+    if blocchi_falliti:
+        # Stesso principio "tutto o niente" degli altri due importatori: mai
+        # consegnare ricette a metà.
+        raise ValueError("Impossibile analizzare l'intero file: " + "; ".join(blocchi_falliti))
+
+    result_payload = {"ricette": all_ricette}
     yield json.dumps({"result": result_payload}) + "\n"
