@@ -4,7 +4,7 @@ from database.config import Database
 from utils.auth_utils import get_user_sede
 from utils.ai_parser import parse_ricette_excel_with_ai_stream
 from utils.ai_usage import check_and_log_ai_usage
-from routers.produzione import _calcola_ingredienti_e_costo
+from routers.produzione import _crea_ricetta_completa
 import json
 import logging
 from models.produzione import SaveImportRicetteRequest
@@ -67,57 +67,61 @@ async def upload_excel_for_import_ricette(
 @router.post("/save")
 def save_imported_ricette(request: SaveImportRicetteRequest, auth_data = Depends(get_user_sede)):
     id_sede = auth_data["id_sede"]
-
-    if not request.ricette:
-        return {"message": "Nessuna ricetta da salvare", "inserite": 0}
-
-    payload = [r.model_dump() for r in request.ricette]
-
-    try:
-        # save_import_ricette (sql/016): crea tutte le ricette e i relativi
-        # ingredienti in un'unica transazione, calcolando il food cost con la
-        # stessa formula di _calcola_ingredienti_e_costo — un fallimento a
-        # metà non deve lasciare ricette orfane senza ingredienti.
-        res = supabase.rpc("save_import_ricette", {
-            "p_id_sede": id_sede,
-            "p_ricette": payload,
-        }).execute()
-        return {"message": "Importazione completata con successo", "inserite": len(res.data or [])}
-    except Exception as e:
-        if getattr(e, "code", None) != "PGRST202":  # "function not found" (PostgREST)
-            logger.exception("save_imported_ricette: errore nel salvataggio")
-            raise HTTPException(status_code=400, detail=f"Errore nel salvataggio: {str(e)}")
-
-    # Fallback: sql/016 non ancora eseguita sul DB. Stessa logica di
-    # create_ricetta (routers/produzione.py), ripetuta per ogni ricetta:
-    # funziona, solo senza la garanzia di atomicità dell'RPC.
-    logger.info("save_import_ricette non ancora presente sul DB (sql/016 non eseguito): fallback a insert singole")
     inserite = 0
-    try:
-        for ricetta in request.ricette:
-            ricetta_insert = {
-                "nome_ricetta": ricetta.nome_ricetta,
-                "descrizione_ricetta": ricetta.descrizione_ricetta,
-                "id_categoria_prodotto": ricetta.id_categoria_prodotto,
-                "id_sede": id_sede,
-                "costo_ricetta_reale": 0.0,
-                "prezzo_vendita_lordo": ricetta.prezzo_vendita_lordo,
-                "prezzo_vendita_netto": ricetta.prezzo_vendita_netto,
-                "id_iva_vendita": ricetta.id_iva_vendita,
-            }
-            res_ricetta = supabase.table("ricette").insert(ricetta_insert).execute()
-            id_ricetta_creata = res_ricetta.data[0]["id"]
+    sospese_inserite = 0
 
-            ingredienti_da_inserire, costo_totale_ricetta = _calcola_ingredienti_e_costo(
-                id_sede, id_ricetta_creata, ricetta.ingredienti
-            )
-            if ingredienti_da_inserire:
-                supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
+    # 1) Ricette pronte (ogni ingrediente già abbinato a un articolo reale):
+    # RPC atomica con fallback per-riga se sql/016 non è ancora stata
+    # eseguita sul DB — invariato rispetto a prima, solo racchiuso in un
+    # `if` perché ora questo blocco può anche essere vuoto (import con SOLO
+    # ricette incomplete).
+    if request.ricette:
+        payload = [r.model_dump() for r in request.ricette]
+        try:
+            # save_import_ricette (sql/016): crea tutte le ricette e i
+            # relativi ingredienti in un'unica transazione, calcolando il
+            # food cost con la stessa formula di _calcola_ingredienti_e_costo
+            # — un fallimento a metà non deve lasciare ricette orfane senza
+            # ingredienti.
+            res = supabase.rpc("save_import_ricette", {
+                "p_id_sede": id_sede,
+                "p_ricette": payload,
+            }).execute()
+            inserite = len(res.data or [])
+        except Exception as e:
+            if getattr(e, "code", None) != "PGRST202":  # "function not found" (PostgREST)
+                logger.exception("save_imported_ricette: errore nel salvataggio")
+                raise HTTPException(status_code=400, detail=f"Errore nel salvataggio: {str(e)}")
 
-            supabase.table("ricette").update({"costo_ricetta_reale": round(costo_totale_ricetta, 2)}).eq("id", id_ricetta_creata).execute()
-            inserite += 1
-    except Exception as e:
-        logger.exception("save_imported_ricette: errore nel salvataggio (fallback)")
-        raise HTTPException(status_code=400, detail=f"Errore nel salvataggio (ricetta {inserite + 1} di {len(request.ricette)}): {str(e)}")
+            # Fallback: sql/016 non ancora eseguita sul DB. Stessa logica di
+            # create_ricetta (routers/produzione.py, via _crea_ricetta_completa
+            # condivisa), ripetuta per ogni ricetta: funziona, solo senza la
+            # garanzia di atomicità dell'RPC.
+            logger.info("save_import_ricette non ancora presente sul DB (sql/016 non eseguito): fallback a insert singole")
+            try:
+                for ricetta in request.ricette:
+                    _crea_ricetta_completa(id_sede, ricetta)
+                    inserite += 1
+            except Exception as e2:
+                logger.exception("save_imported_ricette: errore nel salvataggio (fallback)")
+                raise HTTPException(status_code=400, detail=f"Errore nel salvataggio (ricetta {inserite + 1} di {len(request.ricette)}): {str(e2)}")
 
-    return {"message": "Importazione completata con successo", "inserite": inserite}
+    # 2) Ricette incomplete -> ricette_sospese, MAI perse (vedi sql/017).
+    # Fatto DOPO le ricette pronte apposta: se questo blocco fallisce, le
+    # ricette valide sono comunque già salvate — le due liste sono
+    # indipendenti dal punto di vista della persistenza, anche se una
+    # singola azione utente le sottopone insieme.
+    if request.ricette_sospese:
+        righe = [{"id_sede": id_sede, **r.model_dump()} for r in request.ricette_sospese]
+        try:
+            for i in range(0, len(righe), 100):
+                chunk = righe[i:i + 100]
+                supabase.table("ricette_sospese").insert(chunk).execute()
+                sospese_inserite += len(chunk)
+        except Exception as e:
+            logger.exception("save_imported_ricette: errore nel salvataggio delle ricette sospese")
+            raise HTTPException(status_code=400, detail=f"Ricette pronte salvate ({inserite}), ma errore nel salvataggio di quelle in sospeso: {str(e)}")
+
+    if inserite == 0 and sospese_inserite == 0:
+        return {"message": "Nessuna ricetta da salvare", "inserite": 0, "sospese": 0}
+    return {"message": "Importazione completata con successo", "inserite": inserite, "sospese": sospese_inserite}

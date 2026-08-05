@@ -48,8 +48,30 @@ class ParsedRicetta(BaseModel):
 class ParsedRicetteResult(BaseModel):
     ricette: List[ParsedRicetta]
 
-# Corpo di /api/produzione/import/save: le ricette confermate dall'utente,
-# ingredienti già risolti a id_materia_prima reali — stessa forma esatta di
-# RicettaCreate (nessun modello duplicato per lo stesso payload).
+# --- RICETTE SOSPESE (import parzialmente completato) ---
+# Stessa forma di IngredienteImportato/RicettaImportata lato frontend:
+# id_materia_prima è QUI opzionale (a differenza di IngredienteRicettaItem)
+# perché una riga sospesa può avere ingredienti ancora non abbinati a un
+# articolo reale — è esattamente il motivo per cui la ricetta è "sospesa"
+# invece di poter essere salvata subito come RicettaCreate.
+class IngredienteSospesoItem(BaseModel):
+    nome_ingrediente_estratto: str
+    quantita: float
+    id_materia_prima: Optional[str] = None
+    perc_scarto: float = 0.0
+
+class RicettaSospesaInput(BaseModel):
+    nome_ricetta: str = ""
+    id_categoria_prodotto: Optional[int] = None
+    prezzo_vendita_netto: float = 0.0
+    prezzo_vendita_lordo: float = 0.0
+    id_iva_vendita: Optional[int] = None
+    ingredienti: List[IngredienteSospesoItem] = []
+
+# Corpo di /api/produzione/import/save: le ricette pronte (ingredienti già
+# risolti a id_materia_prima reali, stessa forma esatta di RicettaCreate) e
+# quelle ancora incomplete, che finiscono in ricette_sospese invece di
+# essere perse — vedi sql/017_ricette_sospese.sql.
 class SaveImportRicetteRequest(BaseModel):
-    ricette: List[RicettaCreate]
+    ricette: List[RicettaCreate] = []
+    ricette_sospese: List[RicettaSospesaInput] = []

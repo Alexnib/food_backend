@@ -3,6 +3,7 @@ from database.config import Database
 from models.produzione import *
 from utils.auth_utils import get_user_sede
 from utils.numbers import round2
+from utils.db_fetch import call_rpc_or_none
 
 router = APIRouter(prefix="/api/produzione", tags=["Produzione e Ricette"])
 supabase = Database.get_client()
@@ -93,59 +94,74 @@ def ricalcola_costo_ricette(id_ricetta_list: list) -> None:
         supabase.table("ricette").update({"costo_ricetta_reale": round(costo_totale, 2)}).eq("id", ricetta["id"]).execute()
 
 
+def _crea_ricetta_completa(id_sede: str, data: RicettaCreate) -> dict:
+    """Crea una ricetta completa (ricetta + ingredienti + food cost reale),
+    stesso identico procedimento a 3 passi già usato da create_ricetta.
+    Condivisa anche da resolve_ricetta_sospesa (una ricetta sospesa risolta
+    è, a tutti gli effetti, una RicettaCreate come qualunque altra) e dal
+    fallback non atomico di /api/produzione/import/save quando sql/016 non
+    è ancora stata eseguita."""
+    # 1. Creiamo il "contenitore" della ricetta (costo temporaneo 0)
+    ricetta_insert = {
+        "nome_ricetta": data.nome_ricetta,
+        "descrizione_ricetta": data.descrizione_ricetta,
+        "id_categoria_prodotto": data.id_categoria_prodotto,
+        "id_sede": id_sede,
+        "costo_ricetta_reale": 0.0,
+        "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
+        "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
+        "id_iva_vendita": data.id_iva_vendita
+    }
+    res_ricetta = supabase.table("ricette").insert(ricetta_insert).execute()
+    id_ricetta_creata = res_ricetta.data[0]["id"]
+
+    # 2. Calcoliamo il costo di ogni ingrediente e li prepariamo per l'inserimento
+    ingredienti_da_inserire, costo_totale_ricetta = _calcola_ingredienti_e_costo(
+        id_sede, id_ricetta_creata, data.ingredienti
+    )
+
+    # Inseriamo tutti gli ingredienti nel DB in un colpo solo (Bulk Insert)
+    if ingredienti_da_inserire:
+        supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
+
+    # 3. Aggiorniamo la ricetta con il VERO Food Cost e i Margini calcolati
+    costo_finale = round(costo_totale_ricetta, 2)
+
+    supabase.table("ricette").update({
+        "costo_ricetta_reale": costo_finale,
+        "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
+        "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
+        "id_iva_vendita": data.id_iva_vendita
+    }).eq("id", id_ricetta_creata).execute()
+
+    return {"id": id_ricetta_creata, "costo_ricetta_reale": costo_finale}
+
+
 @router.post("/ricette", status_code=status.HTTP_201_CREATED)
 def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
     try:
-        id_sede = auth_data["id_sede"]
-
-        # 1. Creiamo il "contenitore" della ricetta (costo temporaneo 0)
-        ricetta_insert = {
-            "nome_ricetta": data.nome_ricetta,
-            "descrizione_ricetta": data.descrizione_ricetta,
-            "id_categoria_prodotto": data.id_categoria_prodotto,
-            "id_sede": id_sede,
-            "costo_ricetta_reale": 0.0,
-            "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
-            "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
-            "id_iva_vendita": data.id_iva_vendita
-        }
-        res_ricetta = supabase.table("ricette").insert(ricetta_insert).execute()
-        id_ricetta_creata = res_ricetta.data[0]["id"]
-
-        # 2. Calcoliamo il costo di ogni ingrediente e li prepariamo per l'inserimento
-        ingredienti_da_inserire, costo_totale_ricetta = _calcola_ingredienti_e_costo(
-            id_sede, id_ricetta_creata, data.ingredienti
-        )
-
-        # Inseriamo tutti gli ingredienti nel DB in un colpo solo (Bulk Insert)
-        if ingredienti_da_inserire:
-            supabase.table("ingredienti_ricetta").insert(ingredienti_da_inserire).execute()
-
-        # 3. Aggiorniamo la ricetta con il VERO Food Cost e i Margini calcolati
-        costo_finale = round(costo_totale_ricetta, 2)
-
-        supabase.table("ricette").update({
-            "costo_ricetta_reale": costo_finale,
-            "prezzo_vendita_lordo": round2(data.prezzo_vendita_lordo),
-            "prezzo_vendita_netto": round2(data.prezzo_vendita_netto),
-            "id_iva_vendita": data.id_iva_vendita
-        }).eq("id", id_ricetta_creata).execute()
-
-        return {
-            "message": "Ricetta creata con successo", 
-            "id": id_ricetta_creata,
-            "costo_ricetta_reale": costo_finale
-        }
-    
+        risultato = _crea_ricetta_completa(auth_data["id_sede"], data)
+        return {"message": "Ricetta creata con successo", **risultato}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/ricette")
 def get_ricette(auth_data = Depends(get_user_sede)):
-    # Restituiamo le ricette e includiamo in automatico i loro ingredienti nidificati e categorie!
-    # Paginazione interna per recuperare SEMPRE tutte le righe, anche oltre il cap di righe di
-    # PostgREST/Supabase su una singola query (~1000), stesso pattern usato in routers/vendite.py.
     id_sede = auth_data["id_sede"]
+
+    # Percorso veloce: get_ricette_con_dettagli (sql/018) fa il join con
+    # categoria e ingredienti dentro Postgres, evitando il resource
+    # embedding di PostgREST — lo stesso tipo già mostratosi inaffidabile
+    # altrove (vedi database/config.py): è la causa del sintomo "dopo aver
+    # modificato la distinta base bisogna ricaricare la pagina per vedere le
+    # modifiche", perché l'embed può restituire dati non ancora aggiornati
+    # subito dopo una scrittura. Fallback identico (stesso shape, stesso
+    # embed PostgREST di prima) se la funzione non è ancora stata eseguita
+    # sul DB.
+    rows = call_rpc_or_none("get_ricette_con_dettagli", {"p_id_sede": id_sede}, order_cols=["nome_ricetta"])
+    if rows is not None:
+        return rows
+
     select_query = "*, categoria_prodotti(nome_categoria), ingredienti_ricetta(*, articoli(nome_articolo, unita_misura, prezzo_acquisto_netto))"
 
     tutte_le_ricette = []
@@ -221,6 +237,58 @@ def delete_ricetta(id: str, auth_data = Depends(get_user_sede)):
         return {"message": "Ricetta eliminata"}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- RICETTE SOSPESE (import parzialmente completato, vedi sql/017) ---
+# Stesso identico ruolo/pattern di vendite_sospese in routers/vendite.py:
+# le ricette che l'import Excel non riesce a completare (nome/categoria
+# mancante o ingrediente non abbinato) non vengono perse, restano qui finché
+# l'utente non le risolve o le elimina esplicitamente.
+
+@router.get("/ricette/sospese")
+def get_ricette_sospese(auth_data = Depends(get_user_sede)):
+    id_sede = auth_data["id_sede"]
+    data = []
+    page = 0
+    page_size = 1000
+    while True:
+        res = supabase.table("ricette_sospese").select("*").eq("id_sede", id_sede)\
+            .order("created_at", desc=True).range(page * page_size, (page + 1) * page_size - 1).execute()
+        if not res.data:
+            break
+        data.extend(res.data)
+        if len(res.data) < page_size:
+            break
+        page += 1
+    return data
+
+
+@router.delete("/ricette/sospese/{id}")
+def delete_ricetta_sospesa(id: str, auth_data = Depends(get_user_sede)):
+    res = supabase.table("ricette_sospese").delete().eq("id", id).eq("id_sede", auth_data["id_sede"]).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Ricetta sospesa non trovata o non autorizzata.")
+    return {"message": "Ricetta sospesa eliminata"}
+
+
+@router.post("/ricette/sospese/{id}/resolve", status_code=status.HTTP_201_CREATED)
+def resolve_ricetta_sospesa(id: str, data: RicettaCreate, auth_data = Depends(get_user_sede)):
+    """Una ricetta sospesa risolta è, a tutti gli effetti, una RicettaCreate
+    come qualunque altra (id_materia_prima obbligatorio per ogni ingrediente
+    fa sì che Pydantic rifiuti da solo, con un 422, un tentativo di risolvere
+    con ingredienti ancora non abbinati — nessuna validazione extra qui).
+    Stesso pattern non atomico di resolve_vendita_sospesa: due chiamate
+    sequenziali, nessun rollback se la seconda fallisce."""
+    id_sede = auth_data["id_sede"]
+    check = supabase.table("ricette_sospese").select("id").eq("id", id).eq("id_sede", id_sede).execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Ricetta sospesa non trovata.")
+    try:
+        risultato = _crea_ricetta_completa(id_sede, data)
+        supabase.table("ricette_sospese").delete().eq("id", id).execute()
+        return {"message": "Ricetta risolta con successo", **risultato}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
