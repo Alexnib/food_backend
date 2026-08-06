@@ -4,6 +4,7 @@ from utils.auth_utils import get_current_user, security
 from models.auth import UserRegister, UserLogin, RefreshTokenRequest, ForgotPassword, UpdatePassword, UpdateUser
 from fastapi.responses import RedirectResponse
 from supabase import create_client
+from supabase_auth.errors import AuthApiError
 from database.config import Database
 import os
 import time
@@ -76,10 +77,26 @@ def login(credentials: UserLogin):
             "password": credentials.password
         })
         logging.info(f"Login attempt for {credentials.email}: {'Success' if auth_res.user else 'Failed'}")
-    except Exception as e:
-        logging.info(f"Tentativo di login fallito per {credentials.email}: {e}") 
+    except AuthApiError as e:
+        logging.info(f"Tentativo di login fallito per {credentials.email}: {e}")
+        # Prima qualunque errore di sign_in_with_password (password sbagliata,
+        # email non confermata, ecc.) diventava lo stesso generico "email o
+        # password non valide" — chi si registra e non conferma l'email
+        # riceveva un messaggio che sembrava dire "hai sbagliato password",
+        # non "devi prima confermare l'email".
+        if e.code == "email_not_confirmed":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Devi prima confermare la tua email: controlla la tua casella di posta (anche lo spam) e clicca sul link di conferma."
+            )
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Email o password non valide."
+        )
+    except Exception as e:
+        logging.info(f"Tentativo di login fallito per {credentials.email}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email o password non valide."
         )
     try:
@@ -208,21 +225,41 @@ def forgot_password(data: ForgotPassword):
         return {"message": "Se l'email è registrata, riceverai a breve un link per reimpostare la password."}
 
 @router.put("/me/password")
-def update_password(data: UpdatePassword, current_user = Depends(get_current_user)):
+def update_password(
+    data: UpdatePassword,
+    current_user = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """
     2. Cambio Password (Protetta).
-    Cambia la password dell'utente attualmente loggato.
+    Cambia la password dell'utente attualmente loggato (sia dal profilo che
+    dal link "reimposta password" ricevuto per email, che arriva qui con un
+    token di recupero temporaneo invece della sessione normale).
     """
     try:
-        # Usiamo l'API Admin di Supabase per sovrascrivere la password 
-        # dell'utente di cui abbiamo validato l'identità tramite il JWT.
-        admin_client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-        
-        admin_client.auth.admin.update_user_by_id(
-            current_user.id,
-            {"password": data.new_password}
-        )
+        # Prima si usava l'API Admin (admin.update_user_by_id): funziona per
+        # cambiare la password, ma è un percorso diverso da quello
+        # "self-service" (PUT /auth/v1/user) a cui è legata la notifica email
+        # nativa di Supabase "Password changed" — con l'Admin API la password
+        # cambiava ma l'email di notifica non partiva mai. Impersoniamo quindi
+        # l'utente con il suo stesso token (già validato da get_current_user)
+        # e chiamiamo l'update self-service, che fa scattare la notifica.
+        user_client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+        user_client.auth.set_session(credentials.credentials, credentials.credentials)
+        user_client.auth.update_user({"password": data.new_password})
         return {"message": "Password aggiornata con successo."}
+    except AuthApiError as e:
+        # Messaggi di Supabase arrivano solo in inglese: traduciamo i codici
+        # che un utente può realmente incontrare qui, il resto resta un
+        # messaggio generico piuttosto che l'inglese grezzo di Supabase.
+        messaggi = {
+            "same_password": "La nuova password deve essere diversa da quella attuale.",
+            "weak_password": "La password scelta è troppo debole: provane una più complessa.",
+        }
+        raise HTTPException(
+            status_code=400,
+            detail=messaggi.get(e.code, "Errore durante il cambio password.")
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Errore durante il cambio password: {str(e)}")
 

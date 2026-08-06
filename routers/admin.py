@@ -15,7 +15,11 @@ supabase = Database.get_client()
 
 
 def require_admin(current_user=Depends(get_current_user)):
-    if get_user_role(current_user.id) != ADMIN_ROLE_ID:
+    ruolo = get_user_role(current_user.id)
+    # Log temporaneo per diagnosticare la lista utenti/chat vuota subito dopo
+    # il login (segnalato dall'utente) — da togliere quando non serve più.
+    print(f"[ADMIN] require_admin: user_id={current_user.id} ruolo_risolto={ruolo!r} (ADMIN_ROLE_ID={ADMIN_ROLE_ID!r})")
+    if ruolo != ADMIN_ROLE_ID:
         raise HTTPException(status_code=403, detail="Accesso riservato agli amministratori.")
     return current_user
 
@@ -37,16 +41,39 @@ def list_users(_: object = Depends(require_admin)):
     il sintomo osservato qui: lista utenti a volte vuota o incompleta finché
     non passano un paio di minuti). Fallback identico se non ancora creata.
     """
-    rows = call_rpc_or_none("get_admin_users_list", {"p_role_id": USER_ROLE_ID}, order_cols=["id"])
+    rows = call_rpc_or_none("get_admin_users_list", {"p_role_id": USER_ROLE_ID}, order_cols=["id"], retry_if_empty=True)
     if rows is not None:
+        print(f"[ADMIN] list_users: percorso RPC, righe={len(rows)}")
         return rows
 
+    print("[ADMIN] list_users: RPC non disponibile, fallback a select embedded")
     res = supabase.table("users").select(
         "id, nome, cognome, email, telefono, is_blocked, is_verified, id_sede, "
         "sedi(comune, indirizzo, negozi(nome_negozio))"
     ).eq("role", USER_ROLE_ID).execute()
 
+    print(f"[ADMIN] list_users: fallback, righe={len(res.data or [])}")
     return res.data or []
+
+
+@router.get("/users/{user_id}")
+def get_user_detail(user_id: str, _: object = Depends(require_admin)):
+    """
+    Profilo completo di un singolo utente (role 2), per il pulsante
+    "Informazioni" nella sezione Admin — a differenza di list_users (che
+    resta volutamente leggera per la tabella), qui servono anche i campi non
+    mostrati in lista: data di registrazione, stato di verifica, indirizzo
+    completo della sede, dati del negozio (partita IVA compresa).
+    """
+    res = supabase.table("users").select(
+        "id, nome, cognome, email, telefono, is_blocked, is_verified, auth_provider, created_at, id_sede, "
+        "sedi(comune, indirizzo, civico, nome_responsabile, cognome_responsabile, created_at, "
+        "negozi(nome_negozio, partita_iva, created_at))"
+    ).eq("id", user_id).eq("role", USER_ROLE_ID).execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Utente non trovato.")
+    return res.data[0]
 
 
 @router.put("/users/{user_id}/blocco")

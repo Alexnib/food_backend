@@ -1,8 +1,10 @@
 # utils/auth_utils.py
+import os
 import time
 from typing import Optional
 from fastapi import Depends, HTTPException, status, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from supabase import create_client
 from database.config import Database
 
 security = HTTPBearer()
@@ -61,10 +63,29 @@ _ID_SEDE_CACHE: dict[str, tuple[str, float]] = {}
 _ID_SEDE_CACHE_TTL = 300  # 5 minuti
 
 
-def get_user_role(user_id: str) -> Optional[int]:
+def _select_users_or_retry_fresh(select_cols: str, user_id: str):
+    """
+    SELECT su public.users con lo stesso accorgimento già verificato più
+    volte in questa sessione: il client condiviso e a lunga vita di questo
+    processo (vedi database/config.py) può occasionalmente tornare 0 righe
+    per una query che dovrebbe SEMPRE averne una — un client nuovo di zecca,
+    usato una volta e scartato, la stessa identica chiamata la esegue
+    sempre correttamente. Qui è particolarmente delicato: questa tabella è
+    letta da get_user_role/get_user_sede, cioè su quasi ogni richiesta
+    autenticata — un falso vuoto qui blocca un utente vero con un 403/404
+    senza alcun motivo reale.
+    """
     supabase = Database.get_client()
-    info = supabase.table("users").select("role").eq("id", user_id).execute()
-    return info.data[0].get("role") if info.data else None
+    res = supabase.table("users").select(select_cols).eq("id", user_id).execute()
+    if res.data:
+        return res.data
+    fresh = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    return fresh.table("users").select(select_cols).eq("id", user_id).execute().data
+
+
+def get_user_role(user_id: str) -> Optional[int]:
+    data = _select_users_or_retry_fresh("role", user_id)
+    return data[0].get("role") if data else None
 
 
 def get_user_sede(
@@ -84,8 +105,6 @@ def get_user_sede(
     rispettata blocca la richiesta invece di ricadere silenziosamente sui
     dati dell'admin.
     """
-    supabase = Database.get_client()
-
     if x_view_as_user_id:
         if request.method != "GET":
             raise HTTPException(
@@ -96,11 +115,11 @@ def get_user_sede(
         if get_user_role(current_user.id) != ADMIN_ROLE_ID:
             raise HTTPException(status_code=403, detail="Non autorizzato a visualizzare i dati di un altro utente.")
 
-        target_info = supabase.table("users").select("id_sede, role").eq("id", x_view_as_user_id).execute()
-        if not target_info.data:
+        target_data = _select_users_or_retry_fresh("id_sede, role", x_view_as_user_id)
+        if not target_data:
             raise HTTPException(status_code=404, detail="Utente non trovato.")
 
-        target = target_info.data[0]
+        target = target_data[0]
         if target.get("role") != USER_ROLE_ID:
             raise HTTPException(status_code=403, detail="Puoi visualizzare solo utenze di tipo 'user'.")
         if not target.get("id_sede"):
@@ -112,12 +131,12 @@ def get_user_sede(
     if cached and (time.time() - cached[1]) < _ID_SEDE_CACHE_TTL:
         return {"user_id": current_user.id, "id_sede": cached[0]}
 
-    user_info = supabase.table("users").select("id_sede").eq("id", current_user.id).execute()
+    user_data = _select_users_or_retry_fresh("id_sede", current_user.id)
 
-    if not user_info.data or not user_info.data[0].get("id_sede"):
+    if not user_data or not user_data[0].get("id_sede"):
         raise HTTPException(status_code=403, detail="Devi avere una sede assegnata per compiere questa operazione.")
 
-    id_sede = user_info.data[0]["id_sede"]
+    id_sede = user_data[0]["id_sede"]
     _ID_SEDE_CACHE[current_user.id] = (id_sede, time.time())
 
     return {

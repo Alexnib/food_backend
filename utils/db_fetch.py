@@ -20,7 +20,7 @@ _RPC_STATE: dict = {}
 _RPC_RECHECK_TTL = 120  # secondi
 
 
-def call_rpc_or_none(nome: str, params: dict, order_cols: list = None, page_size: int = 1000, max_workers: int = 4):
+def call_rpc_or_none(nome: str, params: dict, order_cols: list = None, page_size: int = 1000, max_workers: int = 4, retry_if_empty: bool = False):
     """
     Chiama una funzione SQL (RPC) e ritorna TUTTE le righe. Ritorna None se la
     funzione non esiste ancora o se la chiamata fallisce per qualsiasi motivo:
@@ -37,13 +37,29 @@ def call_rpc_or_none(nome: str, params: dict, order_cols: list = None, page_size
     (prefisso "-" per discendente), e senza un ordinamento deterministico le
     pagine di richieste separate possono sovrapporsi/perdere righe. Usare le
     colonne del GROUP BY della funzione (combinazione unica).
+
+    retry_if_empty: riprova UNA volta se il risultato torna vuoto — verificato
+    con test reali (ripetuti più volte, anche a distanza di minuti) che la
+    STESSA identica RPC, con gli STESSI parametri, torna sistematicamente 0
+    righe quando eseguita sul client HTTP condiviso e a lunga vita di questo
+    processo (vedi database/config.py), mentre un client Supabase appena
+    creato — usato una volta e scartato — la stessa identica chiamata
+    funziona SEMPRE (verificato ripetutamente). Per questo il ritentativo non
+    riusa lo stesso client condiviso (un semplice "riprova" non basterebbe:
+    l'ho verificato, torna vuoto anche ripetuto identico) ma ne crea uno
+    nuovo di zecca solo per questo secondo tentativo — più lento (una nuova
+    connessione), ma è l'unica cosa che si è dimostrata affidabile al 100%
+    nei test. Da usare SOLO per RPC dove un risultato vuoto è plausibilmente
+    sospetto (es. lista utenti admin, categorie di una sede che esiste), non
+    per RPC dove "zero righe" è uno stato normale legittimo.
     """
     state = _RPC_STATE.get(nome)
     if state and state[0] is False and (time.time() - state[1]) < _RPC_RECHECK_TTL:
         return None
-    try:
+
+    def _esegui(client):
         def q(with_count):
-            b = Database.get_client().rpc(nome, params, count="exact" if with_count else None)
+            b = client.rpc(nome, params, count="exact" if with_count else None)
             for col in (order_cols or []):
                 if col.startswith("-"):
                     b = b.order(col[1:], desc=True)
@@ -66,13 +82,28 @@ def call_rpc_or_none(nome: str, params: dict, order_cols: list = None, page_size
                 for chunk in ex.map(_fetch, ranges):
                     rows.extend(chunk)
 
-        _RPC_STATE[nome] = (True, time.time())
-
         # Guardia: se per qualunque motivo non abbiamo TUTTE le righe promesse
         # dal count, meglio il fallback (corretto) di un totale monco. Non
         # marchiamo la funzione come assente: è un problema transitorio.
         if first.count is not None and len(rows) != first.count:
             return None
+        return rows
+
+    try:
+        rows = _esegui(Database.get_client())
+        if rows is not None and len(rows) == 0 and retry_if_empty:
+            # Log temporaneo per confermare quando scatta il ritentativo e con
+            # quale esito — da togliere quando non serve più.
+            print(f"[RPC] {nome}: primo tentativo vuoto (client condiviso), ritento con un client nuovo...")
+            import os
+            from supabase import create_client as _create_client
+            client_fresco = _create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+            rows = _esegui(client_fresco)
+            print(f"[RPC] {nome}: esito del ritentativo (client nuovo), righe={len(rows) if rows is not None else None}")
+
+        if rows is None:
+            return None
+        _RPC_STATE[nome] = (True, time.time())
         return rows
     except Exception:
         _RPC_STATE[nome] = (False, time.time())

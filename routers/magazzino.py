@@ -31,8 +31,20 @@ def get_iva():
 @router.get("/destinazioni")
 def get_destinazioni():
     """Le 2 destinazioni fisse (Food / Beverage) usate per organizzare le
-    categorie prodotto nello schema visuale in Gestione Categorie."""
-    res = supabase.table("destinazione_prodotto").select("*").execute()
+    categorie prodotto nello schema visuale in Gestione Categorie.
+
+    Client Supabase nuovo di zecca invece di quello condiviso (stesso
+    accorgimento già usato per get_iva qui sopra): verificato con test reali
+    che proprio questa tabella, letta con il client condiviso e a lunga vita
+    del processo, può tornare vuota — ed è una tabella di sole 2 righe fisse
+    che non cambiano mai, quindi un risultato vuoto è sempre e solo un
+    sintomo del client, mai un dato vero. Se questa query torna vuota, TUTTE
+    le categorie del grafico Food/Beverage risultano "senza destinazione":
+    è esattamente il sintomo segnalato."""
+    import os
+    from supabase import create_client
+    local_supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    res = local_supabase.table("destinazione_prodotto").select("*").execute()
     return res.data
 
 @router.post("/categorie", status_code=status.HTTP_201_CREATED)
@@ -58,14 +70,22 @@ def _get_categorie(id_sede: str, id_macro_categoria: int = None) -> list:
         "get_categorie_prodotti",
         {"p_id_sede": id_sede, "p_id_macro_categoria": id_macro_categoria},
         order_cols=["id"],
+        retry_if_empty=True,
     )
     if rows is not None:
+        # Log temporaneo per diagnosticare lo schema Food/Beverage vuoto
+        # subito dopo il login (segnalato dall'utente) — da togliere quando
+        # non serve più.
+        print(f"[MAGAZZINO] _get_categorie: percorso RPC, id_sede={id_sede} righe={len(rows)}")
         return rows
 
+    print(f"[MAGAZZINO] _get_categorie: RPC non disponibile, fallback a select embedded (id_sede={id_sede})")
     query = supabase.table("categoria_prodotti").select("*, provenienza_prodotto(*), destinazione_prodotto(id, name)").eq("id_sede", id_sede)
     if id_macro_categoria is not None:
         query = query.eq("id_macro_categoria", id_macro_categoria)
-    return query.execute().data
+    dati = query.execute().data
+    print(f"[MAGAZZINO] _get_categorie: fallback, righe={len(dati or [])}")
+    return dati
 
 @router.get("/categorie")
 def get_categorie(auth_data = Depends(get_user_sede)):
