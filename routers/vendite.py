@@ -785,30 +785,38 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
         )
         food_cost_unitario = food_cost_ricette.get(data.id_ricetta) if data.id_ricetta else food_cost_articoli.get(data.id_prodotto_commerciale)
 
-        # Crea la vendita reale
-        record = {
-            "data_vendita": data_vendita_finale,
-            "quantita": quantita_finale,
-            "id_sede": auth_data["id_sede"],
-            "id_ricetta": data.id_ricetta,
-            "id_prodotto_commerciale": data.id_prodotto_commerciale,
-            "prezzo_singolo": prezzo_singolo,
-            "prezzo_totale": prezzo_totale,
-        }
-        if prezzo_singolo_lordo is not None:
-            record["prezzo_singolo_lordo"] = prezzo_singolo_lordo
-            record["prezzo_totale_lordo"] = totale_lordo
-        if food_cost_unitario is not None:
-            record["food_cost_unitario"] = round2(food_cost_unitario)
-            record["food_cost_totale"] = round(food_cost_unitario * quantita_finale, 2)
+        # Scrittura in vendite via la stessa RPC atomica dell'import bulk
+        # (sql/013_vendite_bulk_upsert_rpc.sql), non più un insert diretto:
+        # un insert "cieco" falliva con un 23505 grezzo non tradotto ogni
+        # volta che esisteva già una vendita per lo stesso prodotto/giorno/
+        # sede (indice UNIQUE ux_vendite_key_ricetta) — e la sospesa restava
+        # bloccata per sempre, perché l'eccezione interrompeva la funzione
+        # prima della DELETE da vendite_sospese qui sotto. La RPC gestisce da
+        # sola il caso "esiste già": somma la quantità invece di fallire,
+        # esattamente come farebbe un secondo import dello stesso giorno.
+        rpc_res = supabase.rpc("upsert_vendite_bulk", {
+            "p_id_sede": auth_data["id_sede"],
+            "p_groups": [{
+                "data_vendita": data_vendita_finale,
+                "id_ricetta": data.id_ricetta,
+                "id_prodotto_commerciale": data.id_prodotto_commerciale,
+                "delta_quantita": quantita_finale,
+                "prezzo_singolo": prezzo_singolo,
+                "totale_netto_esatto": prezzo_totale,
+                "totale_lordo_esatto": totale_lordo,
+                "food_cost_unitario": round2(food_cost_unitario) if food_cost_unitario is not None else None,
+                "prezzo_singolo_lordo": prezzo_singolo_lordo,
+            }],
+        }).execute()
+        if not rpc_res.data:
+            raise HTTPException(status_code=500, detail="Errore durante il salvataggio della vendita.")
 
-        # Inserisci in vendite
-        supabase.table("vendite").insert(record).execute()
-        
         # Elimina da vendite_sospese
         supabase.table("vendite_sospese").delete().eq("id", id).execute()
-        
+
         return {"message": "Vendita risolta con successo"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
