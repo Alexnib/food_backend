@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from database.config import Database
 from utils.auth_utils import get_user_sede
+from utils.errors import errore_http
 from utils.db_fetch import call_rpc_or_none, run_parallel, fetch_all_parallel
 from datetime import datetime, timedelta
 import calendar
@@ -388,7 +389,7 @@ def get_overview(periodo: str = "this_month", custom_start: str = None, custom_e
             "distribuzione": distribuzione
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'overview', 'Errore nel calcolo delle statistiche.', 500)
 
 @router.get("/controllo-gestione/{anno}")
 def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
@@ -447,7 +448,7 @@ def get_pl_annuale(anno: int, auth_data = Depends(get_user_sede)):
         return risultato_finale
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'controllo-gestione', 'Errore nel calcolo del controllo di gestione.', 500)
 
 
 # ==========================================
@@ -706,7 +707,7 @@ def get_food_cost_analytics(
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'food-cost', 'Errore nel calcolo del food cost.', 500)
 
 
 # ==========================================
@@ -804,7 +805,7 @@ def get_ricette_breakdown(auth_data=Depends(get_user_sede)):
         return result
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'ricette-breakdown', 'Errore nel caricamento del dettaglio ricette.', 500)
 
 
 # ==========================================
@@ -928,4 +929,84 @@ def get_andamento_prodotti(
         return result
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'andamento-prodotti', "Errore nel calcolo dell'andamento dei prodotti.", 500)
+
+
+# ============================================================================
+# Storico prezzi d'acquisto (tabella storico_prezzi_acquisto, sql/019-020):
+# andamento nel tempo del prezzo di acquisto di un articolo. Le righe le
+# scrive un trigger su articoli a ogni variazione di prezzo, non questo codice.
+# ============================================================================
+
+@router.get("/storico-prezzi/articoli")
+def get_storico_prezzi_articoli(auth_data = Depends(get_user_sede)):
+    """
+    Articoli con almeno 2 punti nello storico (cioè con almeno una variazione
+    di prezzo da mostrare), per il selettore del grafico. Uno con un solo
+    punto avrebbe un grafico vuoto di significato.
+
+    Ordinati dal movimento più recente. variazione_perc è sul prezzo NETTO,
+    dal primo punto all'ultimo.
+    """
+    id_sede = auth_data["id_sede"]
+
+    def query_storico(with_count):
+        return supabase.table("storico_prezzi_acquisto").select(
+            "id_articolo, prezzo_netto, data_prezzo, created_at",
+            count="exact" if with_count else None,
+        ).eq("id_sede", id_sede)
+
+    def query_articoli(with_count):
+        return supabase.table("articoli").select(
+            "id, nome_articolo, unita_misura",
+            count="exact" if with_count else None,
+        ).eq("id_sede", id_sede).eq("is_cancelled", False)
+
+    storico, articoli = run_parallel(
+        lambda: fetch_all_parallel(query_storico),
+        lambda: fetch_all_parallel(query_articoli),
+    )
+
+    punti_per_articolo = {}
+    for r in storico:
+        punti_per_articolo.setdefault(r["id_articolo"], []).append(r)
+
+    risultato = []
+    for a in articoli:
+        punti = punti_per_articolo.get(a["id"])
+        if not punti or len(punti) < 2:
+            continue
+        punti.sort(key=lambda p: (p["data_prezzo"], p["created_at"]))
+        primo = float(punti[0]["prezzo_netto"])
+        ultimo = float(punti[-1]["prezzo_netto"])
+        risultato.append({
+            "id": a["id"],
+            "nome_articolo": a["nome_articolo"],
+            "unita_misura": a["unita_misura"],
+            "n_punti": len(punti),
+            "prezzo_iniziale": round(primo, 2),
+            "prezzo_attuale": round(ultimo, 2),
+            "variazione_perc": round((ultimo - primo) / primo * 100, 1) if primo > 0 else None,
+            "ultima_data": punti[-1]["data_prezzo"],
+        })
+
+    risultato.sort(key=lambda x: x["ultima_data"], reverse=True)
+    return risultato
+
+
+@router.get("/storico-prezzi/{id_articolo}")
+def get_storico_prezzi_articolo(id_articolo: str, auth_data = Depends(get_user_sede)):
+    """Tutti i punti dello storico prezzi di UN articolo, in ordine di data."""
+    id_sede = auth_data["id_sede"]
+
+    articolo_res = supabase.table("articoli").select(
+        "id, nome_articolo, unita_misura"
+    ).eq("id", id_articolo).eq("id_sede", id_sede).execute()
+    if not articolo_res.data:
+        raise HTTPException(status_code=404, detail="Articolo non trovato.")
+
+    punti_res = supabase.table("storico_prezzi_acquisto").select(
+        "data_prezzo, prezzo_netto, prezzo_lordo, iva_perc, fornitore, fonte"
+    ).eq("id_articolo", id_articolo).eq("id_sede", id_sede).order("data_prezzo").order("created_at").execute()
+
+    return {"articolo": articolo_res.data[0], "punti": punti_res.data or []}

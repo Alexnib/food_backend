@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
-from models.contabilita import *
+from models.contabilita import CategoriaCostoCreate, CostoAnnoMeseCreate, CategoriaCostoUpdate, CostoAnnoMeseUpdate
 from utils.auth_utils import get_user_sede
+from utils.errors import errore_http
 
 router = APIRouter(prefix="/api/contabilita", tags=["Contabilità"])
 supabase = Database.get_client()
@@ -21,7 +22,7 @@ def create_categoria(data: CategoriaCostoCreate, auth_data = Depends(get_user_se
         res = supabase.table("categorie_costi").insert(insert_data).execute()
         return {"message": "Categoria creata", "data": res.data[0]}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'create_categoria', 'Errore durante la creazione della categoria.', 400)
 
 @router.get("/categorie", status_code=status.HTTP_200_OK)
 def get_categorie(auth_data = Depends(get_user_sede)):
@@ -29,7 +30,7 @@ def get_categorie(auth_data = Depends(get_user_sede)):
         res = supabase.table("categorie_costi").select("*").eq("id_sede", auth_data["id_sede"]).execute()
         return res.data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'get_categorie', 'Errore nel caricamento delle categorie.', 500)
     
 @router.put("/categorie/{id}", status_code=status.HTTP_200_OK)
 def update_categoria(id: str, data: CategoriaCostoUpdate, auth_data = Depends(get_user_sede)):
@@ -49,7 +50,7 @@ def update_categoria(id: str, data: CategoriaCostoUpdate, auth_data = Depends(ge
             
         return {"message": "Categoria aggiornata", "data": res.data[0]}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'update_categoria', "Errore durante l'aggiornamento della categoria.", 400)
 
 
 @router.delete("/categorie/{id}", status_code=status.HTTP_200_OK)
@@ -67,7 +68,7 @@ def delete_categoria(id: str, auth_data = Depends(get_user_sede)):
         return {"message": "Categoria eliminata con successo."}
     except Exception as e:
         # Probabile errore se la categoria ha già dei costi associati (Foreign Key constraint)
-        raise HTTPException(status_code=400, detail=f"Impossibile eliminare: {str(e)}")
+        raise errore_http(e, 'delete_categoria', 'Impossibile eliminare la categoria.', 400, per_codice={'23503': 'Impossibile eliminare: la categoria è usata da costi registrati.'})
 
 
 # ---COSTI ANNO MESE---
@@ -88,7 +89,7 @@ def create_costo(data: CostoAnnoMeseCreate, auth_data = Depends(get_user_sede)):
         res = supabase.table("costi_anno_mese").insert(insert_data).execute()
         return {"message": "Costo registrato", "data": res.data[0]}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'create_costo', 'Errore durante il salvataggio del costo.', 400)
     
 @router.get("/costi", status_code=status.HTTP_200_OK)
 def get_costi(auth_data = Depends(get_user_sede)):
@@ -96,7 +97,7 @@ def get_costi(auth_data = Depends(get_user_sede)):
         res = supabase.table("costi_anno_mese").select("*, categorie_costi(*)").eq("id_sede", auth_data["id_sede"]).execute()
         return res.data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'get_costi', 'Errore nel caricamento dei costi.', 500)
           
 @router.put("/costi/{id}", status_code=status.HTTP_200_OK)
 def update_costo(id: str, data: CostoAnnoMeseUpdate, auth_data = Depends(get_user_sede)):
@@ -115,7 +116,7 @@ def update_costo(id: str, data: CostoAnnoMeseUpdate, auth_data = Depends(get_use
             
         return {"message": "Costo aggiornato", "data": res.data[0]}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'update_costo', "Errore durante l'aggiornamento del costo.", 400)
 
 @router.delete("/costi/{id}", status_code=status.HTTP_200_OK)
 def delete_costo(id: str, auth_data = Depends(get_user_sede)):
@@ -126,4 +127,4 @@ def delete_costo(id: str, auth_data = Depends(get_user_sede)):
             .execute()
         return {"message": "Costo eliminato con successo."}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'delete_costo', "Errore durante l'eliminazione del costo.", 400)

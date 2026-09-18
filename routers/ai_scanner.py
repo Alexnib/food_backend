@@ -13,6 +13,7 @@ from google.genai import types
 
 from database.config import Database
 from utils.auth_utils import get_user_sede
+from utils.errors import errore_http
 from utils.ai_usage import check_and_log_ai_usage
 from models.vendite import ScontrinoItem
 
@@ -118,16 +119,31 @@ async def scan_receipts(
     che hanno trovato corrispondenza nel menù (filtro di scarto).
     NON salva nulla nel DB.
     """
-    check_and_log_ai_usage(auth_data["id_sede"], "scan_scontrini")
+    # check_and_log_ai_usage e le due query menù sono chiamate sincrone
+    # (bloccanti) di supabase-py: dentro un endpoint async bloccherebbero
+    # l'intero event loop del server (quindi TUTTE le richieste concorrenti,
+    # non solo questa) per la loro durata, esattamente il problema già
+    # risolto qui sotto per Gemini con client.aio. asyncio.to_thread le sposta
+    # su un thread del pool; le due query menù, indipendenti tra loro, partono
+    # anche in parallelo invece che in sequenza.
+    await asyncio.to_thread(check_and_log_ai_usage, auth_data["id_sede"], "scan_scontrini")
+
     # 1. Recupera l'intero menù della sede (esclusi i prodotti eliminati: non ha
     # senso far associare l'IA a un prodotto non più in vendita).
-    finiti_res = supabase.table("ricette").select(
-        "id, nome_ricetta"
-    ).eq("id_sede", auth_data["id_sede"]).eq("is_cancelled", False).execute()
+    def _fetch_finiti():
+        return supabase.table("ricette").select(
+            "id, nome_ricetta"
+        ).eq("id_sede", auth_data["id_sede"]).eq("is_cancelled", False).execute()
 
-    commerciali_res = supabase.table("articoli").select(
-        "id, nome_articolo"
-    ).eq("is_rivendita", True).eq("id_sede", auth_data["id_sede"]).eq("is_cancelled", False).execute()
+    def _fetch_commerciali():
+        return supabase.table("articoli").select(
+            "id, nome_articolo"
+        ).eq("is_rivendita", True).eq("id_sede", auth_data["id_sede"]).eq("is_cancelled", False).execute()
+
+    finiti_res, commerciali_res = await asyncio.gather(
+        asyncio.to_thread(_fetch_finiti),
+        asyncio.to_thread(_fetch_commerciali),
+    )
 
     menu = []
     menu_lookup = {}
@@ -235,7 +251,7 @@ async def scan_receipts(
             arricchiti.append(item)
             
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Errore parsing: {str(e)}")
+        raise errore_http(e, 'scan_receipts parsing', "Non è stato possibile interpretare la risposta dell'AI. Riprova.", 422)
 
     input_tokens = response.usage_metadata.prompt_token_count
     output_tokens = response.usage_metadata.candidates_token_count

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Literal
 
 class CategoriaProdottoCreate(BaseModel):
     nome_categoria: str
@@ -69,9 +69,14 @@ class ImportItem(BaseModel):
     costo_lordo: float
     id_categoria: Optional[Union[int, str]] = None
     fornitore: Optional[str] = None
+    # Data del prezzo per lo storico: quella della fattura, se nota; senza
+    # (import Excel) o se non valida, il backend usa oggi.
+    data_prezzo: Optional[str] = None
 
 class SaveImportRequest(BaseModel):
     prodotti: List[ImportItem]
+    # Da dove arriva l'import, registrato come "fonte" nello storico prezzi.
+    fonte: Literal["fattura", "excel"] = "excel"
 
 class FatturaProdotto(BaseModel):
     nome_prodotto: str = Field(description="Nome del prodotto/articolo acquistato, così come scritto in fattura")
@@ -79,6 +84,7 @@ class FatturaProdotto(BaseModel):
     prezzo_acquisto_netto: Optional[float] = Field(None, description="Prezzo unitario NETTO (imponibile, IVA esclusa) di acquisto")
     prezzo_acquisto_lordo: Optional[float] = Field(None, description="Prezzo unitario LORDO (IVA inclusa) di acquisto")
     iva_percentuale: Optional[float] = Field(None, description="Aliquota IVA applicata a questa riga, es. 4, 10, 22")
+    data_documento: Optional[str] = Field(None, description="Data di emissione della fattura a cui appartiene questa riga, formato YYYY-MM-DD")
 
 class FatturaParseResult(BaseModel):
     fornitore: Optional[str] = Field(None, description="Nome/ragione sociale del fornitore in fattura")

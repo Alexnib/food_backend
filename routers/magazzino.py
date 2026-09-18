@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
-from models.magazzino import *
+from models.magazzino import CategoriaProdottoCreate, CategoriaProdottoUpdate, ArticoloCreate, ArticoloUpdate
 from utils.auth_utils import get_user_sede
 from utils.numbers import round2
 from utils.db_fetch import call_rpc_or_none

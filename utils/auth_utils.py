@@ -1,4 +1,5 @@
 # utils/auth_utils.py
+import logging
 import os
 import time
 from typing import Optional
@@ -6,6 +7,8 @@ from fastapi import Depends, HTTPException, status, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client
 from database.config import Database
+
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
 
@@ -48,9 +51,13 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except HTTPException:
         raise
     except Exception as e:
+        # Il dettaglio (scadenza, firma, formato...) resta nei log: al client
+        # non serve e rivelerebbe come viene validato il token. 401 invariato,
+        # è quello su cui il frontend fa scattare il refresh della sessione.
+        logger.info("Token rifiutato: %s", e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token non valido: {str(e)}"
+            detail="Sessione scaduta o non valida"
         )
 
 

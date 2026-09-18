@@ -2,9 +2,11 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from database.config import Database
 from utils.auth_utils import get_user_sede
+from utils.errors import errore_http, messaggio_pubblico
 from utils.ai_parser import parse_ricette_excel_with_ai_stream
 from utils.ai_usage import check_and_log_ai_usage
 from routers.produzione import _crea_ricetta_completa
+import asyncio
 import json
 import logging
 from models.produzione import SaveImportRicetteRequest
@@ -32,13 +34,19 @@ async def upload_excel_for_import_ricette(
     (materie prime) e /api/vendite/import/upload.
     """
     id_sede = auth_data["id_sede"]
-    check_and_log_ai_usage(id_sede, "import_excel_ricette")
+    # check_and_log_ai_usage e la select categorie sono chiamate sincrone di
+    # supabase-py: dentro questo endpoint async bloccherebbero l'event loop
+    # (e con esso tutte le richieste concorrenti del server) per la loro
+    # durata — asyncio.to_thread le sposta su un thread del pool.
+    await asyncio.to_thread(check_and_log_ai_usage, id_sede, "import_excel_ricette")
 
     # Solo le categorie ricette (id_macro_categoria = 2), stesso filtro di
     # GET /api/magazzino/categorie/ricette: le ricette importate vanno
     # abbinate alle stesse categorie di quelle create a mano, non a
     # qualunque categoria della sede.
-    cat_res = supabase.table("categoria_prodotti").select("*").eq("id_sede", id_sede).eq("id_macro_categoria", 2).execute()
+    cat_res = await asyncio.to_thread(
+        lambda: supabase.table("categoria_prodotti").select("*").eq("id_sede", id_sede).eq("id_macro_categoria", 2).execute()
+    )
     categorie = cat_res.data or []
 
     content = await file.read()
@@ -51,7 +59,7 @@ async def upload_excel_for_import_ricette(
             ):
                 yield chunk
         except Exception as e:
-            yield json.dumps({"error": str(e)}) + "\n"
+            yield json.dumps({"error": messaggio_pubblico(e, "upload_excel_for_import_ricette", "Errore durante l'analisi del file. Riprova.")}) + "\n"
 
     # Content-Encoding esplicito: disattiva il GZipMiddleware globale (vedi
     # main.py) su questa risposta, altrimenti Starlette bufferizza gli eventi
@@ -91,7 +99,7 @@ def save_imported_ricette(request: SaveImportRicetteRequest, auth_data = Depends
         except Exception as e:
             if getattr(e, "code", None) != "PGRST202":  # "function not found" (PostgREST)
                 logger.exception("save_imported_ricette: errore nel salvataggio")
-                raise HTTPException(status_code=400, detail=f"Errore nel salvataggio: {str(e)}")
+                raise errore_http(e, 'save_imported_ricette', 'Errore durante il salvataggio delle ricette.', 400)
 
             # Fallback: sql/016 non ancora eseguita sul DB. Stessa logica di
             # create_ricetta (routers/produzione.py, via _crea_ricetta_completa
@@ -104,7 +112,7 @@ def save_imported_ricette(request: SaveImportRicetteRequest, auth_data = Depends
                     inserite += 1
             except Exception as e2:
                 logger.exception("save_imported_ricette: errore nel salvataggio (fallback)")
-                raise HTTPException(status_code=400, detail=f"Errore nel salvataggio (ricetta {inserite + 1} di {len(request.ricette)}): {str(e2)}")
+                raise errore_http(e2, "save_imported_ricette (fallback)", f"Errore nel salvataggio (ricetta {inserite + 1} di {len(request.ricette)}).", 400)
 
     # 2) Ricette incomplete -> ricette_sospese, MAI perse (vedi sql/017).
     # Fatto DOPO le ricette pronte apposta: se questo blocco fallisce, le
@@ -120,7 +128,7 @@ def save_imported_ricette(request: SaveImportRicetteRequest, auth_data = Depends
                 sospese_inserite += len(chunk)
         except Exception as e:
             logger.exception("save_imported_ricette: errore nel salvataggio delle ricette sospese")
-            raise HTTPException(status_code=400, detail=f"Ricette pronte salvate ({inserite}), ma errore nel salvataggio di quelle in sospeso: {str(e)}")
+            raise errore_http(e, 'save_imported_ricette (sospese)', 'Le ricette pronte sono state salvate, ma non è stato possibile salvare quelle in sospeso.', 400)
 
     if inserite == 0 and sospese_inserite == 0:
         return {"message": "Nessuna ricetta da salvare", "inserite": 0, "sospese": 0}

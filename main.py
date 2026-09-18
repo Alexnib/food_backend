@@ -1,8 +1,9 @@
-from fastapi import FastAPI
+import logging
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from routers.test import router as test
-from routers.managment import router as management 
+from fastapi.responses import JSONResponse
+from routers.managment import router as management
 from routers.auth import router as auth
 from routers.contabilita import router as contabilita
 from routers.magazzino import router as magazzino
@@ -15,7 +16,17 @@ from routers.chat import router as chat
 from routers import import_magazzino
 from routers import import_produzione
 
+logger = logging.getLogger("gest.errori")
+
 app = FastAPI(title="Gestionale Food API")
+
+
+@app.exception_handler(Exception)
+async def gestore_errori_non_gestiti(request: Request, exc: Exception):
+    """Rete di sicurezza: un'eccezione che nessun endpoint ha gestito non deve
+    mostrare al client lo stack o il testo interno. Il dettaglio va nei log."""
+    logger.error("Errore non gestito su %s %s", request.method, request.url.path, exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": "Errore interno del server. Riprova più tardi."})
 
 
 app.add_middleware(
@@ -31,7 +42,6 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
-app.include_router(test)
 app.include_router(management)
 app.include_router(auth)
 app.include_router(contabilita)

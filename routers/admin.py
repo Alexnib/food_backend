@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
 from utils.auth_utils import get_current_user, get_user_role, ADMIN_ROLE_ID, USER_ROLE_ID
 from utils.db_fetch import call_rpc_or_none
 from database.config import Database
+from models.admin import BlockStatusUpdate
 from models.chat import ChatStatoUpdate
 from routers.chat import _map_chat
 
@@ -22,10 +22,6 @@ def require_admin(current_user=Depends(get_current_user)):
     if ruolo != ADMIN_ROLE_ID:
         raise HTTPException(status_code=403, detail="Accesso riservato agli amministratori.")
     return current_user
-
-
-class BlockStatusUpdate(BaseModel):
-    is_blocked: bool
 
 
 @router.get("/users")

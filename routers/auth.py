@@ -1,14 +1,34 @@
 from fastapi import APIRouter, HTTPException, status, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from utils.auth_utils import get_current_user, security
+from utils.errors import errore_http
+from utils.rate_limit import (
+    limita_login_ip, limita_login_email, limita_registrazione_ip,
+    limita_recupero_ip, limita_recupero_email,
+)
 from models.auth import UserRegister, UserLogin, RefreshTokenRequest, ForgotPassword, UpdatePassword, UpdateUser
 from fastapi.responses import RedirectResponse
 from supabase import create_client
 from supabase_auth.errors import AuthApiError
 from database.config import Database
 import os
+import sys
 import time
 import logging
+
+# Logger dedicato agli accessi, visibile nei log di Render. Il resto del
+# codice usa logging.info(), che con la configurazione di default di Python
+# (solo warning e superiori) non compare nei log: un logger con un handler
+# proprio su stdout rende visibili solo queste righe, senza cambiare il
+# livello dei log dell'intera app. Registra SOLO l'email e l'esito: mai
+# password, token o altri dati.
+login_logger = logging.getLogger("gest.login")
+if not login_logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("[LOGIN] %(message)s"))
+    login_logger.addHandler(_handler)
+login_logger.setLevel(logging.INFO)
+login_logger.propagate = False
 
 router = APIRouter(
     prefix="/auth",
@@ -18,7 +38,7 @@ router = APIRouter(
 supabase = Database.get_client()
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-def register(user: UserRegister):
+def register(user: UserRegister, _: None = Depends(limita_registrazione_ip)):
     try:
         check_email = supabase.table("users").select("id").eq("email", user.email).execute()
         
@@ -66,19 +86,22 @@ def register(user: UserRegister):
     except HTTPException as he:
         raise he
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'register', 'Errore durante la registrazione.', 400, per_codice={'user_already_exists': 'Un account con questa email è già registrato.', 'email_exists': 'Un account con questa email è già registrato.', 'weak_password': 'La password scelta è troppo debole: provane una più complessa.', 'email_address_invalid': 'Indirizzo email non valido.', 'signup_disabled': 'Le registrazioni sono al momento disabilitate.', 'over_email_send_rate_limit': 'Troppe richieste di registrazione. Riprova più tardi.', 'over_request_rate_limit': 'Troppe richieste. Riprova più tardi.'})
     
 @router.post("/login")
-def login(credentials: UserLogin):
+def login(credentials: UserLogin, _: None = Depends(limita_login_ip)):
+    # Limite per email oltre a quello per IP: protegge il singolo account da
+    # tentativi ripetuti anche se arrivano da IP diversi.
+    limita_login_email(credentials.email)
+
     # BLOCCO 1: Autenticazione (Supabase Auth)
     try:
         auth_res = supabase.auth.sign_in_with_password({
             "email": credentials.email,
             "password": credentials.password
         })
-        logging.info(f"Login attempt for {credentials.email}: {'Success' if auth_res.user else 'Failed'}")
     except AuthApiError as e:
-        logging.info(f"Tentativo di login fallito per {credentials.email}: {e}")
+        login_logger.info("Accesso fallito: %s", credentials.email)
         # Prima qualunque errore di sign_in_with_password (password sbagliata,
         # email non confermata, ecc.) diventava lo stesso generico "email o
         # password non valide" — chi si registra e non conferma l'email
@@ -94,7 +117,7 @@ def login(credentials: UserLogin):
             detail="Email o password non valide."
         )
     except Exception as e:
-        logging.info(f"Tentativo di login fallito per {credentials.email}: {e}")
+        login_logger.info("Accesso fallito: %s", credentials.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email o password non valide."
@@ -115,6 +138,7 @@ def login(credentials: UserLogin):
                 admin_client.auth.admin.sign_out(auth_res.session.access_token, "global")
             except Exception as e:
                 logging.warning(f"Impossibile revocare la sessione dell'utente bloccato {auth_res.user.id}: {e}")
+            login_logger.info("Accesso negato (in attesa di approvazione): %s", credentials.email)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Il tuo account è in attesa di approvazione da parte di un amministratore."
@@ -126,8 +150,9 @@ def login(credentials: UserLogin):
             sede_info = supabase.table("sedi").select("*, negozi(*)").eq("id", user_data["id_sede"]).execute()
             user_data["sedi"] = sede_info.data[0] if sede_info.data else None
         else:
-            user_data["sedi"] = None 
+            user_data["sedi"] = None
 
+        login_logger.info("Accesso effettuato: %s", credentials.email)
         return {
             "message": "Login effettuato",
             "access_token": auth_res.session.access_token,
@@ -202,14 +227,20 @@ def google_login():
         })
         return {"url": res.url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'google_login', "Impossibile avviare l'accesso con Google.", 500)
     
 @router.post("/forgot-password")
-def forgot_password(data: ForgotPassword):
+def forgot_password(data: ForgotPassword, _: None = Depends(limita_recupero_ip)):
     """
     1. Richiesta di Reset Password (Pubblica).
     Invia un'email con un link univoco all'utente.
     """
+    # Limite per email (oltre a quello per IP), applicato a QUALUNQUE indirizzo
+    # esista o no: non rivela quali email sono registrate, e impedisce di
+    # inondare di email di reset la casella di una persona. Fuori dal try: il
+    # 429 non deve essere inghiottito dal "risposta sempre uguale" qui sotto.
+    limita_recupero_email(data.email)
+
     try:
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
         
@@ -261,7 +292,7 @@ def update_password(
             detail=messaggi.get(e.code, "Errore durante il cambio password.")
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Errore durante il cambio password: {str(e)}")
+        raise errore_http(e, 'update_password', 'Errore durante il cambio password.', 400)
 
 @router.put("/me")
 def update_profile(data: UpdateUser, current_user = Depends(get_current_user)):
@@ -290,7 +321,7 @@ def update_profile(data: UpdateUser, current_user = Depends(get_current_user)):
             "user": res.data[0] if res.data else None
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Errore aggiornamento profilo: {str(e)}")
+        raise errore_http(e, 'update_profile', "Errore durante l'aggiornamento del profilo.", 400)
 
 
 # Nessuna auto-cancellazione: un utente non può eliminare il proprio account.

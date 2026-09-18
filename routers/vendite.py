@@ -1,15 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from database.config import Database
-from models.vendite import *
+from models.vendite import VenditaCreate, VenditaUpdate, VenditaBulkPayload, VenditaBulkDelete, VenditaBulkPrezzoUpdate, VenditaSospesaResolve
 from utils.auth_utils import get_user_sede
+from utils.errors import errore_http, messaggio_pubblico
 from utils.numbers import round2
 from utils.db_fetch import call_rpc_or_none, run_parallel, fetch_all_parallel
+from utils.ai_parser import parse_vendite_excel_with_ai_stream
+from utils.ai_usage import check_and_log_ai_usage
 from fastapi.responses import StreamingResponse
+import asyncio
 import io
+import json
 import time
 import logging
+import calendar
 import pandas as pd
 from datetime import date
+from typing import Optional
 from openpyxl.styles import Font
 
 logger = logging.getLogger(__name__)
@@ -418,8 +425,14 @@ def registra_vendite_bulk(data: VenditaBulkPayload, auth_data=Depends(get_user_s
         # validi) resta un 400 — il resto è un 500, segnale che c'è un bug da
         # investigare, non "colpa" di chi ha caricato il file.
         logger.exception("registra_vendite_bulk: errore inatteso")
-        if isinstance(e, (ValueError, TypeError)) or getattr(e, "code", None) == "PGRST202":
+        # Un ValueError è un errore di validazione scritto da noi: il messaggio
+        # è per l'utente. TypeError e "funzione SQL mancante" (PGRST202) sono
+        # sintomi di dati/config non validi ma con testo tecnico: messaggio
+        # generico, il dettaglio resta nei log qui sopra.
+        if isinstance(e, ValueError):
             raise HTTPException(status_code=400, detail=str(e))
+        if isinstance(e, TypeError) or getattr(e, "code", None) == "PGRST202":
+            raise HTTPException(status_code=400, detail="Dati delle vendite non validi. Controlla il file e riprova.")
         raise HTTPException(status_code=500, detail="Errore interno durante il salvataggio delle vendite. Riprova più tardi.")
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -489,7 +502,7 @@ def registra_vendita(data: VenditaCreate, auth_data = Depends(get_user_sede)):
             res = supabase.table("vendite").insert(insert_data).execute()
             return res.data[0]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'registra_vendita', 'Errore durante il salvataggio della vendita.', 400)
 
 # NOTA: /bulk-prezzo deve restare PRIMA di /{id} qui sotto. Starlette prova le
 # rotte nell'ordine di registrazione: /{id} (PUT) è un pattern a un solo
@@ -616,7 +629,7 @@ def aggiorna_vendita(id: int, data: VenditaUpdate, auth_data = Depends(get_user_
             raise HTTPException(status_code=404, detail="Vendita non trovata o non autorizzato.")
         return res.data[0]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'update_vendita', "Errore durante l'aggiornamento della vendita.", 400)
 
 @router.get("/summary")
 def get_vendite_summary(auth_data = Depends(get_user_sede)):
@@ -652,9 +665,6 @@ def get_vendite_summary(auth_data = Depends(get_user_sede)):
     # Ordina per mese decrescente (i più recenti prima)
     result_list = sorted(list(summary.values()), key=lambda x: x["mese"], reverse=True)
     return result_list
-
-from typing import Optional
-import calendar
 
 @router.get("/per-prodotto")
 def get_vendite_per_prodotto(
@@ -818,7 +828,7 @@ def resolve_vendita_sospesa(id: str, data: VenditaSospesaResolve, auth_data = De
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'resolve_vendita_sospesa', 'Errore durante il salvataggio della vendita.', 400)
 
 
 # Aliquote IVA per prodotto della sede, con una piccola cache: servono solo a
@@ -1008,13 +1018,7 @@ def export_vendite(
         )
 
     except Exception as e:
-        print(f"Excel Export Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-from fastapi import UploadFile, File
-from fastapi.responses import StreamingResponse
-from utils.ai_parser import parse_vendite_excel_with_ai_stream
-from utils.ai_usage import check_and_log_ai_usage
+        raise errore_http(e, 'export_vendite', "Errore durante l'esportazione delle vendite.", 500)
 
 @router.post("/import/upload")
 async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(get_user_sede)):
@@ -1022,7 +1026,11 @@ async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(g
     Riceve il file Excel/CSV, lo legge e lo invia a Gemini per l'estrazione delle vendite.
     Ritorna uno stream NDJSON per aggiornamenti di progresso progressivi e il risultato finale.
     """
-    check_and_log_ai_usage(auth_data["id_sede"], "import_excel_vendite")
+    # Chiamata sincrona di supabase-py: dentro questo endpoint async
+    # bloccherebbe l'event loop (e con esso tutte le richieste concorrenti
+    # del server) per la sua durata — asyncio.to_thread la sposta su un
+    # thread del pool.
+    await asyncio.to_thread(check_and_log_ai_usage, auth_data["id_sede"], "import_excel_vendite")
     content = await file.read()
     filename = file.filename
     
@@ -1031,8 +1039,7 @@ async def upload_excel_vendite(file: UploadFile = File(...), auth_data=Depends(g
             async for chunk in parse_vendite_excel_with_ai_stream(content, filename):
                 yield chunk
         except Exception as e:
-            import json
-            yield json.dumps({"error": str(e)}) + "\n"
+            yield json.dumps({"error": messaggio_pubblico(e, "upload_excel_vendite", "Errore durante l'analisi del file. Riprova.")}) + "\n"
 
     # Content-Encoding esplicito per disattivare il GZipMiddleware globale
     # (vedi main.py) su questa risposta: senza questo, Starlette bufferizza

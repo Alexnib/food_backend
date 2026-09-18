@@ -3,6 +3,7 @@ from models.management import CreateNegozio, CreateSede, UpdateMiaSede
 from database.config import Database
 from uuid import UUID
 from utils.auth_utils import get_current_user, get_user_sede
+from utils.errors import errore_http
 
 router = APIRouter(
     prefix="/api/admin",
@@ -18,7 +19,7 @@ def create_negozio(data: CreateNegozio, current_user = Depends(get_current_user)
         res = supabase.table("negozi").insert(data.model_dump(mode="json")).execute()
         return {"message": "Negozio creato correttamente", "data": res.data}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Errore creazione negozio: {str(e)}")
+        raise errore_http(e, 'create_negozio', 'Errore durante la creazione del negozio.', 400)
     
 @router.post("/sedi", status_code=status.HTTP_201_CREATED)
 def create_sede(data: CreateSede, current_user = Depends(get_current_user)):
@@ -39,7 +40,7 @@ def create_sede(data: CreateSede, current_user = Depends(get_current_user)):
         }
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Errore: {str(e)}")
+        raise errore_http(e, 'create_sede', 'Errore durante la creazione della sede.', 400)
     
 @router.get("/sedi", status_code=status.HTTP_200_OK)
 def lista_sedi(id_negozio: UUID, current_user = Depends(get_current_user)):
@@ -48,7 +49,7 @@ def lista_sedi(id_negozio: UUID, current_user = Depends(get_current_user)):
         res = supabase.from_("sedi").select("*, negozi(*)").eq("id_negozio", str(id_negozio)).execute()
         return res.data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise errore_http(e, 'lista_sedi', 'Errore nel caricamento delle sedi.', 500)
 
 
 @router.get("/sedi/me")

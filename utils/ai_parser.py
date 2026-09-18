@@ -10,6 +10,7 @@ from typing import List, Optional
 import io
 from models.magazzino import ParsedResult, FatturaParseResult
 from models.produzione import ParsedRicetteResult
+from utils.articoli_match import data_prezzo_valida
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,8 @@ async def parse_excel_with_ai_stream(excel_file_bytes: bytes, filename: str, cat
         else:
             df = pd.read_excel(io.BytesIO(excel_file_bytes))
     except Exception as e:
-        raise ValueError(f"Errore nella lettura del file: {str(e)}")
+        logger.warning("Lettura file fallita: %s", e)
+        raise ValueError("Impossibile leggere il file: formato non valido o file danneggiato.")
 
     if len(df) > MAX_RIGHE_EXCEL:
         raise ValueError(
@@ -241,14 +243,16 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
         if chunk_result is None:
             riga_da = start_row + 1
             riga_a = start_row + len(chunk_df)
-            return {"prodotti": [], "errore": f"Righe {riga_da}-{riga_a} del file: {str(last_error)}"}
+            logger.error("Import materie prime, righe %s-%s: %s", riga_da, riga_a, last_error)
+            return {"prodotti": [], "errore": f"Righe {riga_da}-{riga_a} del file: il servizio AI non ha risposto correttamente."}
 
         try:
             parsed_chunk = json.loads(chunk_result)
         except Exception as e:
             riga_da = start_row + 1
             riga_a = start_row + len(chunk_df)
-            return {"prodotti": [], "errore": f"Righe {riga_da}-{riga_a} del file: risposta AI non interpretabile ({str(e)})"}
+            logger.error("Import materie prime, righe %s-%s: risposta AI non interpretabile: %s", riga_da, riga_a, e)
+            return {"prodotti": [], "errore": f"Righe {riga_da}-{riga_a} del file: risposta AI non interpretabile."}
 
         prodotti = parsed_chunk.get("prodotti", [])
         for p in prodotti:
@@ -328,6 +332,7 @@ Poi, per OGNI riga/prodotto elencata nel corpo di TUTTE le fatture fornite, estr
 2. 'unita_misura': l'unità di misura del prezzo UNITARIO (kg, g, lt, ml, pz). Se la fattura riporta un prezzo "a cassa"/"a confezione" con più pezzi dentro, calcola il prezzo per la singola unità base (es. prezzo a cassa da 6 bottiglie -> prezzo a bottiglia): non lasciare mai il prezzo dell'intera confezione.
 3. 'prezzo_acquisto_netto' e 'prezzo_acquisto_lordo': il prezzo UNITARIO (non il totale di riga, non il totale della fattura). Sulle fatture italiane il prezzo unitario riportato riga per riga è quasi sempre l'IMPONIBILE (netto, IVA esclusa): valorizza in quel caso 'prezzo_acquisto_netto' con quel valore. Se conosci l'aliquota IVA di quella riga, calcola anche 'prezzo_acquisto_lordo' = netto * (1 + iva/100), arrotondato a 2 decimali; altrimenti lascialo null. Se invece il documento indica ESPLICITAMENTE che il prezzo unitario riportato è già IVA inclusa, fai il ragionamento inverso.
 4. 'iva_percentuale': l'aliquota IVA di quella riga (es. 4, 10, 22). Se la fattura usa un codice IVA anziché la percentuale, deducila dal riepilogo IVA in fondo al documento.
+5. 'data_documento': la data di EMISSIONE della fattura a cui appartiene quella riga, in formato YYYY-MM-DD (es. 2026-09-03). Con più fatture, ogni riga porta la data della SUA fattura. Usa la data della fattura, non la data di scadenza del pagamento né la data di consegna; se non è leggibile con certezza lasciala null.
 
 Regole generali:
 - NON includere righe di riepilogo, subtotali, sconti a piè di fattura, spese di trasporto/imballo/bolli, a meno che non siano beni/materiali effettivamente acquistati.
@@ -371,6 +376,9 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto. Nessun comme
                     p["prezzo_acquisto_netto"] = round(float(p["prezzo_acquisto_netto"]), 2)
                 if p.get("prezzo_acquisto_lordo") is not None:
                     p["prezzo_acquisto_lordo"] = round(float(p["prezzo_acquisto_lordo"]), 2)
+                # Data della fattura per lo storico prezzi d'acquisto: se manca,
+                # non è valida o è futura si usa oggi (vedi data_prezzo_valida).
+                p["data_documento"] = data_prezzo_valida(p.get("data_documento")).isoformat()
             return json.dumps(parsed)
         except Exception as e:
             last_error = e
@@ -378,7 +386,8 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto. Nessun comme
                 time.sleep(2 ** attempt)
                 continue
 
-    raise ValueError(f"Errore AI dopo {max_retries} tentativi: {str(last_error)}")
+    logger.error("Analisi fattura fallita dopo %s tentativi: %s", max_retries, last_error)
+    raise ValueError(f"L'analisi della fattura non è riuscita dopo {max_retries} tentativi: il servizio AI non ha risposto correttamente. Riprova tra qualche minuto.")
 
 
 async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: str):
@@ -416,7 +425,8 @@ async def parse_vendite_excel_with_ai_stream(excel_file_bytes: bytes, filename: 
             nome_foglio_scelto = max(fogli, key=lambda nome: len(fogli[nome]))
             df = fogli[nome_foglio_scelto]
     except Exception as e:
-        raise ValueError(f"Errore nella lettura del file: {str(e)}")
+        logger.warning("Lettura file fallita: %s", e)
+        raise ValueError("Impossibile leggere il file: formato non valido o file danneggiato.")
 
     if len(df) > MAX_RIGHE_EXCEL:
         raise ValueError(
@@ -551,7 +561,7 @@ Restituisci SOLO il JSON valido. Nessun commento o markdown.
         riga_a = start_row + len(chunk_df)
         return {
             "vendite": [],
-            "errore": f"Righe {riga_da}-{riga_a} del file: {str(last_error)}",
+            "errore": f"Righe {riga_da}-{riga_a} del file: il servizio AI non ha risposto correttamente.",
         }
 
     # Creazione dei task
@@ -707,7 +717,8 @@ async def parse_ricette_excel_with_ai_stream(
             nome_foglio_scelto = max(fogli, key=lambda nome: len(fogli[nome]))
             df = fogli[nome_foglio_scelto]
     except Exception as e:
-        raise ValueError(f"Errore nella lettura del file: {str(e)}")
+        logger.warning("Lettura file fallita: %s", e)
+        raise ValueError("Impossibile leggere il file: formato non valido o file danneggiato.")
 
     if df.empty:
         raise ValueError("Il file non contiene righe da importare.")
@@ -965,12 +976,14 @@ Ritorna ESCLUSIVAMENTE un JSON valido seguendo lo schema richiesto.
 
         nomi_blocco = ", ".join(b["nome_ricetta"] for b in blocchi_chunk)
         if chunk_result is None:
-            return {"ricette": [], "errore": f"Ricette '{nomi_blocco}': {str(last_error)}"}
+            logger.error("Import ricette '%s': %s", nomi_blocco, last_error)
+            return {"ricette": [], "errore": f"Ricette '{nomi_blocco}': il servizio AI non ha risposto correttamente."}
 
         try:
             parsed_chunk = json.loads(chunk_result)
         except Exception as e:
-            return {"ricette": [], "errore": f"Ricette '{nomi_blocco}': risposta AI non interpretabile ({str(e)})"}
+            logger.error("Import ricette '%s': risposta AI non interpretabile: %s", nomi_blocco, e)
+            return {"ricette": [], "errore": f"Ricette '{nomi_blocco}': risposta AI non interpretabile."}
 
         ricette_estratte = parsed_chunk.get("ricette", [])
         _correggi_quantita_con_originali(ricette_estratte, blocchi_chunk)

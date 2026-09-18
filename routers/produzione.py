@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from database.config import Database
-from models.produzione import *
+from models.produzione import RicettaCreate
 from utils.auth_utils import get_user_sede
+from utils.errors import errore_http
 from utils.numbers import round2
 from utils.db_fetch import call_rpc_or_none
 
@@ -143,7 +144,7 @@ def create_ricetta(data: RicettaCreate, auth_data = Depends(get_user_sede)):
         risultato = _crea_ricetta_completa(auth_data["id_sede"], data)
         return {"message": "Ricetta creata con successo", **risultato}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'create_ricetta', 'Errore durante la creazione della ricetta.', 400)
 
 @router.get("/ricette")
 def get_ricette(auth_data = Depends(get_user_sede)):
@@ -209,7 +210,7 @@ def update_ricetta(id: str, data: RicettaCreate, auth_data = Depends(get_user_se
 
         return {"message": "Ricetta aggiornata", "id": id, "costo_ricetta_reale": costo_finale}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'update_ricetta', "Errore durante l'aggiornamento della ricetta.", 400)
 
 @router.delete("/ricette/{id}")
 def delete_ricetta(id: str, auth_data = Depends(get_user_sede)):
@@ -238,7 +239,7 @@ def delete_ricetta(id: str, auth_data = Depends(get_user_sede)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise errore_http(e, 'delete_ricetta', "Errore durante l'eliminazione della ricetta.", 400)
 
 
 # --- RICETTE SOSPESE (import parzialmente completato, vedi sql/017) ---
@@ -290,5 +291,5 @@ def resolve_ricetta_sospesa(id: str, data: RicettaCreate, auth_data = Depends(ge
         supabase.table("ricette_sospese").delete().eq("id", id).execute()
         return {"message": "Ricetta risolta con successo", **risultato}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+        raise errore_http(e, 'resolve_ricetta_sospesa', 'Errore durante il salvataggio della ricetta.', 400)
+
